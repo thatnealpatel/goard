@@ -9,6 +9,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"encoding/gob"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -42,12 +43,335 @@ var httpClient = &http.Client{
 	},
 }
 
+var pbTemplate pb.ProgressBarTemplate = `{{string . "prefix"}} {{counters . }} {{bar . }} {{percent . }} {{etime . }}`
+
+var (
+	gone            int64
+	unknown         int64
+	nilModOrModule  int64
+	invalidName     int64
+	vendor          int64
+	spam            int64
+	mismatchedGoMod int64
+	invalidGoMod    int64
+	noGoCode        int64
+	noGoMod         int64
+	gcsBytes        int64
+	good            int64
+	goBytes         int64
+	allBytes        int64
+	goFiles         int64
+)
+
+func main() {
+	gob.Register(map[string]string{})
+	cpuprofile := flag.String("cpuprofile", "", "write cpu profile to `FILE`")
+	memprofile := flag.String("memprofile", "", "write memory profile to `FILE`")
+	compress := flag.Bool("z", false, "compress the output tar archive with gzip")
+	index := flag.String("file", "", "read module index from `FILE`")
+	all := flag.Bool("all", false, "include potential forks (mismatching and missing go.mod)")
+	flag.Parse()
+
+	if *cpuprofile != "" {
+		f, err := os.Create(*cpuprofile)
+		if err != nil {
+			log.Fatal("could not create CPU profile: ", err)
+		}
+		defer f.Close()
+		if err := pprof.StartCPUProfile(f); err != nil {
+			log.Fatal("could not start CPU profile: ", err)
+		}
+		defer pprof.StopCPUProfile()
+	}
+
+	log.SetFlags(log.Lshortfile | log.Flags())
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer cancel()
+
+	var latestVersions map[string]string
+	var bar *pb.ProgressBar
+
+	if *index == "" {
+		latestVersions = fetchIndex(ctx, bar)
+	} else {
+		file, err := os.ReadFile(*index)
+		if err != nil {
+			log.Fatalf("cannot read %q: %v", *index, err)
+		}
+		buf := bytes.NewBuffer(file)
+		gob.NewDecoder(buf).Decode(&latestVersions)
+	}
+
+	outMu := &sync.Mutex{}
+	var out io.WriteCloser = os.Stdout
+	if *compress {
+		out = gzip.NewWriter(out)
+	}
+	tw := tar.NewWriter(out)
+
+	bar = pbTemplate.Start(len(latestVersions)).Set("prefix", "Fetching modules...")
+	sem := semaphore.NewWeighted(200)
+	gcp := semaphore.NewWeighted(500) // GCS can take it, and it's way way slower
+	g, ctx := errgroup.WithContext(ctx)
+
+	for path, version := range latestVersions {
+		if err := ctx.Err(); err != nil {
+			bar.Finish()
+			log.Println(err)
+			break
+		}
+
+		if err := sem.Acquire(ctx, 1); err != nil {
+			bar.Finish()
+			log.Println(err)
+			break
+		}
+
+		// In general, fetching the index is far more
+		// expensive than it used to be; instead of
+		// fail-fast, document all errors and continue
+		// greedily building the module index.
+		path, version := path, version
+		g.Go(func() error {
+			releaseOnce := &sync.Once{}
+			defer releaseOnce.Do(func() { sem.Release(1) })
+			defer bar.Increment()
+
+			if strings.Contains(path, "/vendor/") || strings.Contains(path, "/kubernetes/staging/") {
+				atomic.AddInt64(&vendor, 1)
+				return nil
+			}
+			if strings.HasPrefix(path, "github.com/bbiswy/") ||
+				strings.HasPrefix(path, "github.com/wMc27rFqQaH7tQxv3/") {
+				atomic.AddInt64(&spam, 1)
+				return nil
+			}
+			modBytes, err := fetchMod(ctx, path, version)
+			if err == errorInvalidName {
+				atomic.AddInt64(&invalidName, 1)
+				return nil
+			}
+			if err == errorGone {
+				atomic.AddInt64(&gone, 1)
+				return nil
+			}
+			if err != nil {
+				atomic.AddInt64(&unknown, 1)
+				return nil
+			}
+			mod, err := modfile.ParseLax(path+"@"+version, modBytes, nil)
+			if err != nil {
+				atomic.AddInt64(&invalidGoMod, 1)
+				return nil
+			}
+			if mod == nil || mod.Module == nil {
+				// Interestingly, it appears the following
+				// two modules cause a panic due to a nil
+				// pointer; however, nothing interesting
+				// about them other than the fact they don't
+				// compile at this version and are now
+				// archived in GitHub:
+				// - github.com/Maka8ka/Faygo/client@v0.0.0-20220420085059-439b6b39f779
+				// - github.com/maka8ka/faygo/client@v0.0.0-20220420085059-439b6b39f779
+				atomic.AddInt64(&nilModOrModule, 1)
+				return nil
+			}
+			if mod.Module.Mod.Path != path && !*all {
+				atomic.AddInt64(&mismatchedGoMod, 1)
+				return nil
+			}
+
+			url, size, err := fetchZipHead(ctx, path, version)
+			if err == errorGone {
+				atomic.AddInt64(&gone, 1)
+				return nil
+			}
+			if err != nil {
+				atomic.AddInt64(&unknown, 1)
+				return nil
+			}
+			if strings.HasPrefix(url, "https://storage.googleapis.com/") {
+				atomic.AddInt64(&gcsBytes, size)
+				releaseOnce.Do(func() { sem.Release(1) })
+				gcp.Acquire(ctx, 1)
+				defer gcp.Release(1)
+			}
+
+			zipBytes, err := fetchZip(ctx, path, version)
+			if err == errorGone {
+				atomic.AddInt64(&gone, 1)
+				return nil
+			}
+			if err != nil {
+				atomic.AddInt64(&unknown, 1)
+				return nil
+			}
+			atomic.AddInt64(&allBytes, size)
+
+			zipBytesReader := bytes.NewReader(zipBytes)
+			z, err := zip.NewReader(zipBytesReader, size)
+			if err != nil {
+				return err
+			}
+
+			var hasGoMod, hasGoFiles bool
+			var extractedSize uint64
+			for _, f := range z.File {
+				if strings.HasSuffix(f.Name, ".go") {
+					hasGoFiles = true
+				}
+				if strings.HasSuffix(f.Name, "/go.mod") {
+					hasGoMod = true
+				}
+				if !ignoreFile(f.Name) {
+					extractedSize += f.UncompressedSize64
+				}
+			}
+			if !hasGoFiles {
+				atomic.AddInt64(&noGoCode, 1)
+				return nil
+			}
+			if !hasGoMod && !*all {
+				atomic.AddInt64(&noGoMod, 1)
+				return nil
+			}
+			atomic.AddInt64(&good, 1)
+
+			outMu.Lock()
+			defer outMu.Unlock()
+			for _, f := range z.File {
+				if ignoreFile(f.Name) {
+					continue
+				}
+
+				src, err := z.Open(f.Name)
+				if err != nil {
+					return err
+				}
+
+				hdr := &tar.Header{
+					Name: f.Name,
+					Mode: 0664,
+					Size: int64(f.UncompressedSize64),
+				}
+				if err := tw.WriteHeader(hdr); err != nil {
+					return err
+				}
+
+				n, err := io.Copy(tw, src)
+				if err != nil {
+					return err
+				}
+
+				atomic.AddInt64(&goFiles, 1)
+				atomic.AddInt64(&goBytes, n)
+			}
+
+			return nil
+		})
+	}
+
+	if err := g.Wait(); err != nil {
+		bar.Finish()
+		log.Println(err)
+	}
+	if err := tw.Close(); err != nil {
+		log.Println(err)
+	}
+	if err := out.Close(); err != nil {
+		log.Println(err)
+	}
+	bar.Finish()
+
+	fmt.Fprintf(os.Stderr, "\n")
+	fmt.Fprintf(os.Stderr, "Unique modules:       % 7d -\n", len(latestVersions))
+	fmt.Fprintf(os.Stderr, "Vendor paths:         % 7d -\n", vendor)
+	fmt.Fprintf(os.Stderr, "Spam:                 % 7d -\n", spam)
+	fmt.Fprintf(os.Stderr, "Invalid names:        % 7d -\n", invalidName)
+	fmt.Fprintf(os.Stderr, "Gone:                 % 7d -\n", gone)
+	fmt.Fprintf(os.Stderr, "Nil:                  % 7d -\n", nilModOrModule)
+	fmt.Fprintf(os.Stderr, "Unknown:              % 7d -\n", unknown)
+	fmt.Fprintf(os.Stderr, "Invalid go.mod files: % 7d -\n", invalidGoMod)
+	if !*all {
+		fmt.Fprintf(os.Stderr, "Mismatching go.mod:   % 7d -\n", mismatchedGoMod)
+		fmt.Fprintf(os.Stderr, "No go.mod file:       % 7d -\n", noGoMod)
+	}
+	fmt.Fprintf(os.Stderr, "No .go files:         % 7d =\n", noGoCode)
+	fmt.Fprintf(os.Stderr, "                      -------\n")
+	fmt.Fprintf(os.Stderr, "                      % 7d\n", good)
+	fmt.Fprintf(os.Stderr, "\n")
+	fmt.Fprintf(os.Stderr, "Downloaded %d bytes (%d from GCS).\n", allBytes, gcsBytes)
+	fmt.Fprintf(os.Stderr, "Wrote %d Go files (%d bytes).\n", goFiles, goBytes)
+
+	if *memprofile != "" {
+		f, err := os.Create(*memprofile)
+		if err != nil {
+			log.Fatal("could not create memory profile: ", err)
+		}
+		defer f.Close()
+		runtime.GC() // get up-to-date statistics
+		if err := pprof.WriteHeapProfile(f); err != nil {
+			log.Fatal("could not write memory profile: ", err)
+		}
+	}
+}
+
 func newRequestWithContext(ctx context.Context, method, url string) *http.Request {
 	req, err := http.NewRequestWithContext(ctx, method, url, nil)
 	if err != nil {
 		panic(err)
 	}
 	return req
+}
+
+// fetchIndex gets the current module index
+// from sum.golang.org that is required to
+// walk and download Go modules.
+func fetchIndex(ctx context.Context, bar *pb.ProgressBar) map[string]string {
+	latest, err := fetchLatest(ctx)
+	if err != nil {
+		log.Fatal(err)
+	}
+	tree, err := tlog.ParseTree(latest)
+	if err != nil {
+		log.Fatal(err)
+	}
+	bar = pbTemplate.Start64(tree.N).Set("prefix", "Fetching index...")
+	latestVersions := make(map[string]string)
+	i, err := NewIndex(ctx)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	var linesSeen uint64
+	for {
+		v, err := i.next(ctx)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			log.Fatal(err)
+		}
+		linesSeen++
+		bar.Increment()
+
+		if semver.Compare(v.Version, latestVersions[v.Path]) >= 0 {
+			latestVersions[v.Path] = v.Version
+		}
+	}
+	bar.Finish()
+
+	const defaultFilePath = "latest_versions.gob"
+	file, err := os.Create(defaultFilePath)
+	if err != nil {
+		log.Printf("failed to create file: %v", err)
+	}
+	defer file.Close()
+	if err := gob.NewEncoder(file).Encode(&latestVersions); err != nil {
+		log.Printf("failed to encode %s: %v", defaultFilePath, err)
+	}
+
+	return latestVersions
 }
 
 type Index struct {
@@ -133,7 +457,7 @@ func fetchMod(ctx context.Context, path, version string) ([]byte, error) {
 		return nil, err
 	}
 	defer res.Body.Close()
-	if res.StatusCode == http.StatusGone {
+	if res.StatusCode == http.StatusGone || res.StatusCode == http.StatusNotFound {
 		return nil, errorGone
 	}
 	if res.StatusCode != http.StatusOK {
@@ -152,7 +476,7 @@ func fetchZipHead(ctx context.Context, path, version string) (string, int64, err
 		return "", 0, err
 	}
 	defer res.Body.Close()
-	if res.StatusCode == http.StatusGone {
+	if res.StatusCode == http.StatusGone || res.StatusCode == http.StatusNotFound {
 		return "", 0, errorGone
 	}
 	if res.StatusCode != http.StatusOK {
@@ -171,7 +495,7 @@ func fetchZip(ctx context.Context, path, version string) ([]byte, error) {
 		return nil, err
 	}
 	defer res.Body.Close()
-	if res.StatusCode == http.StatusGone {
+	if res.StatusCode == http.StatusGone || res.StatusCode == http.StatusNotFound {
 		return nil, errorGone
 	}
 	if res.StatusCode != http.StatusOK {
@@ -211,265 +535,4 @@ func ignoreFile(name string) bool {
 		return false
 	}
 	return true
-}
-
-var pbTemplate pb.ProgressBarTemplate = `{{string . "prefix"}} {{counters . }} {{bar . }} {{percent . }} {{etime . }}`
-
-func main() {
-	cpuprofile := flag.String("cpuprofile", "", "write cpu profile to `FILE`")
-	memprofile := flag.String("memprofile", "", "write memory profile to `FILE`")
-	compress := flag.Bool("z", false, "compress the output tar archive with gzip")
-	all := flag.Bool("all", false, "include potential forks (mismatching and missing go.mod)")
-	flag.Parse()
-
-	if *cpuprofile != "" {
-		f, err := os.Create(*cpuprofile)
-		if err != nil {
-			log.Fatal("could not create CPU profile: ", err)
-		}
-		defer f.Close()
-		if err := pprof.StartCPUProfile(f); err != nil {
-			log.Fatal("could not start CPU profile: ", err)
-		}
-		defer pprof.StopCPUProfile()
-	}
-
-	log.SetFlags(log.Lshortfile | log.Flags())
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
-	defer cancel()
-
-	latest, err := fetchLatest(ctx)
-	if err != nil {
-		log.Fatal(err)
-	}
-	tree, err := tlog.ParseTree(latest)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	bar := pbTemplate.Start64(tree.N).Set("prefix", "Fetching index...")
-	latestVersions := make(map[string]string)
-
-	i, err := NewIndex(ctx)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	var linesSeen uint64
-	for {
-		v, err := i.next(ctx)
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			log.Fatal(err)
-		}
-		linesSeen++
-		bar.Increment()
-
-		if semver.Compare(v.Version, latestVersions[v.Path]) >= 0 {
-			latestVersions[v.Path] = v.Version
-		}
-	}
-	bar.Finish()
-
-	outMu := &sync.Mutex{}
-	var out io.WriteCloser = os.Stdout
-	if *compress {
-		out = gzip.NewWriter(out)
-	}
-	tw := tar.NewWriter(out)
-
-	bar = pbTemplate.Start(len(latestVersions)).Set("prefix", "Fetching modules...")
-	sem := semaphore.NewWeighted(200)
-	gcp := semaphore.NewWeighted(500) // GCS can take it, and it's way way slower
-	g, ctx := errgroup.WithContext(ctx)
-
-	var gone, invalidName, vendor, spam, mismatchedGoMod, invalidGoMod int64
-	var noGoCode, noGoMod, gcsBytes, good, goBytes, allBytes, goFiles int64
-	for path, version := range latestVersions {
-		if err := ctx.Err(); err != nil {
-			bar.Finish()
-			log.Println(err)
-			break
-		}
-
-		if err := sem.Acquire(ctx, 1); err != nil {
-			bar.Finish()
-			log.Println(err)
-			break
-		}
-
-		path, version := path, version
-		g.Go(func() error {
-			releaseOnce := &sync.Once{}
-			defer releaseOnce.Do(func() { sem.Release(1) })
-			defer bar.Increment()
-
-			if strings.Contains(path, "/vendor/") || strings.Contains(path, "/kubernetes/staging/") {
-				atomic.AddInt64(&vendor, 1)
-				return nil
-			}
-			if strings.HasPrefix(path, "github.com/bbiswy/") ||
-				strings.HasPrefix(path, "github.com/wMc27rFqQaH7tQxv3/") {
-				atomic.AddInt64(&spam, 1)
-				return nil
-			}
-			modBytes, err := fetchMod(ctx, path, version)
-			if err == errorInvalidName {
-				atomic.AddInt64(&invalidName, 1)
-				return nil
-			}
-			if err == errorGone {
-				atomic.AddInt64(&gone, 1)
-				return nil
-			}
-			if err != nil {
-				return err
-			}
-			mod, err := modfile.ParseLax(path+"@"+version, modBytes, nil)
-			if err != nil {
-				atomic.AddInt64(&invalidGoMod, 1)
-				return nil
-			}
-			if mod.Module.Mod.Path != path && !*all {
-				atomic.AddInt64(&mismatchedGoMod, 1)
-				return nil
-			}
-
-			url, size, err := fetchZipHead(ctx, path, version)
-			if err == errorGone {
-				atomic.AddInt64(&gone, 1)
-				return nil
-			}
-			if err != nil {
-				return err
-			}
-			if strings.HasPrefix(url, "https://storage.googleapis.com/") {
-				atomic.AddInt64(&gcsBytes, size)
-				releaseOnce.Do(func() { sem.Release(1) })
-				gcp.Acquire(ctx, 1)
-				defer gcp.Release(1)
-			}
-
-			zipBytes, err := fetchZip(ctx, path, version)
-			if err == errorGone {
-				atomic.AddInt64(&gone, 1)
-				return nil
-			}
-			if err != nil {
-				return err
-			}
-			atomic.AddInt64(&allBytes, size)
-
-			zipBytesReader := bytes.NewReader(zipBytes)
-			z, err := zip.NewReader(zipBytesReader, size)
-			if err != nil {
-				return err
-			}
-
-			var hasGoMod, hasGoFiles bool
-			var extractedSize uint64
-			for _, f := range z.File {
-				if strings.HasSuffix(f.Name, ".go") {
-					hasGoFiles = true
-				}
-				if strings.HasSuffix(f.Name, "/go.mod") {
-					hasGoMod = true
-				}
-				if !ignoreFile(f.Name) {
-					extractedSize += f.UncompressedSize64
-				}
-			}
-			if !hasGoFiles {
-				atomic.AddInt64(&noGoCode, 1)
-				return nil
-			}
-			if !hasGoMod && !*all {
-				atomic.AddInt64(&noGoMod, 1)
-				return nil
-			}
-			atomic.AddInt64(&good, 1)
-
-			outMu.Lock()
-			defer outMu.Unlock()
-			const largeExtractedSize = 100 << 20 // 100MB
-			if extractedSize > largeExtractedSize {
-				bar.Set("prefix", "Fetching modules... [Large module! "+path+"]")
-				bar.Write()
-				defer bar.Set("prefix", "Fetching modules...")
-			}
-			for _, f := range z.File {
-				if ignoreFile(f.Name) {
-					continue
-				}
-
-				src, err := z.Open(f.Name)
-				if err != nil {
-					return err
-				}
-
-				hdr := &tar.Header{
-					Name: f.Name,
-					Mode: 0664,
-					Size: int64(f.UncompressedSize64),
-				}
-				if err := tw.WriteHeader(hdr); err != nil {
-					return err
-				}
-
-				n, err := io.Copy(tw, src)
-				if err != nil {
-					return err
-				}
-
-				atomic.AddInt64(&goFiles, 1)
-				atomic.AddInt64(&goBytes, n)
-			}
-
-			return nil
-		})
-	}
-
-	if err := g.Wait(); err != nil {
-		bar.Finish()
-		log.Println(err)
-	}
-	if err := tw.Close(); err != nil {
-		log.Println(err)
-	}
-	if err := out.Close(); err != nil {
-		log.Println(err)
-	}
-	bar.Finish()
-
-	fmt.Fprintf(os.Stderr, "\n")
-	fmt.Fprintf(os.Stderr, "Unique modules:       % 7d -\n", len(latestVersions))
-	fmt.Fprintf(os.Stderr, "Vendor paths:         % 7d -\n", vendor)
-	fmt.Fprintf(os.Stderr, "Spam:                 % 7d -\n", spam)
-	fmt.Fprintf(os.Stderr, "Invalid names:        % 7d -\n", invalidName)
-	fmt.Fprintf(os.Stderr, "Gone:                 % 7d -\n", gone)
-	fmt.Fprintf(os.Stderr, "Invalid go.mod files: % 7d -\n", invalidGoMod)
-	if !*all {
-		fmt.Fprintf(os.Stderr, "Mismatching go.mod:   % 7d -\n", mismatchedGoMod)
-		fmt.Fprintf(os.Stderr, "No go.mod file:       % 7d -\n", noGoMod)
-	}
-	fmt.Fprintf(os.Stderr, "No .go files:         % 7d =\n", noGoCode)
-	fmt.Fprintf(os.Stderr, "                      -------\n")
-	fmt.Fprintf(os.Stderr, "                      % 7d\n", good)
-	fmt.Fprintf(os.Stderr, "\n")
-	fmt.Fprintf(os.Stderr, "Downloaded %d bytes (%d from GCS).\n", allBytes, gcsBytes)
-	fmt.Fprintf(os.Stderr, "Wrote %d Go files (%d bytes).\n", goFiles, goBytes)
-
-	if *memprofile != "" {
-		f, err := os.Create(*memprofile)
-		if err != nil {
-			log.Fatal("could not create memory profile: ", err)
-		}
-		defer f.Close()
-		runtime.GC() // get up-to-date statistics
-		if err := pprof.WriteHeapProfile(f); err != nil {
-			log.Fatal("could not write memory profile: ", err)
-		}
-	}
 }
