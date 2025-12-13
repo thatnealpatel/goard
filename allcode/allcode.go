@@ -94,6 +94,9 @@ func main() {
 	var latestVersions map[string]string
 	var bar *pb.ProgressBar
 
+	// Either fetch and cache a fresh index,
+	// or use a cached version of a previous
+	// index.
 	if *index == "" {
 		latestVersions = fetchIndex(ctx, bar)
 		// cache it after fetching
@@ -121,6 +124,9 @@ func main() {
 	}
 	tw := tar.NewWriter(out)
 
+	// logs.txt has a loose structure
+	// that documents large modules
+	// that contain no .go files.
 	fd, err := os.Create("logs.txt")
 	if err != nil {
 		log.Fatal(err)
@@ -128,14 +134,6 @@ func main() {
 	defer fd.Close()
 	dlog := log.New(fd, "", os.O_RDWR)
 	dlog.SetFlags(0)
-
-	fd2, err := os.Create("sus.txt")
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer fd2.Close()
-	suslog := log.New(fd2, "", os.O_RDWR)
-	suslog.SetFlags(0)
 
 	bar = pbTemplate.Start(len(latestVersions)).Set("prefix", "Fetching modules...")
 
@@ -165,7 +163,7 @@ func main() {
 		// In general, fetching the index is far more
 		// expensive than it used to be; instead of
 		// fail-fast, document all errors and continue
-		// greedily building the module index.
+		// greedily building the local module cache..
 		path, version := path, version
 		g.Go(func() error {
 			releaseOnce := &sync.Once{}
@@ -251,14 +249,22 @@ func main() {
 
 			var hasGoMod, hasGoFiles bool
 			var extractedSize uint64
-			files := make([]string, 0, len(z.File))
-			sizes := make([]uint64, 0, len(z.File))
+			var totalSize uint64
+			ls := make([][2]any, 0, len(z.File))
 			exts := make(map[string]uint64)
 			modVers := path + "@" + version
 			for _, f := range z.File {
-				files = append(files, f.Name)
-				sizes = append(sizes, f.UncompressedSize64)
 				_, localName, _ := strings.Cut(f.Name, modVers)
+
+				// sort by size later
+				ls = append(ls, [2]any{"." + localName, f.UncompressedSize64})
+
+				// since we only consider this size
+				// when hasGoFiles is false, it is
+				// equivalent to conditionally adding
+				// up the sizes of non-Go files.
+				totalSize += f.UncompressedSize64
+
 				idx := strings.LastIndex(localName, ".")
 				if idx >= 0 && idx+1 < len(localName) {
 					exts[localName[idx+1:]] += f.UncompressedSize64
@@ -277,12 +283,8 @@ func main() {
 
 			// Go modules containing 0% Go content.
 			if !hasGoFiles {
-				atomic.AddInt64(&noGoCode, 1)
-				var sum uint64
-				for _, size := range sizes {
-					sum += size
-				}
-				atomic.AddUint64(&nonGoSize, sum)
+				atomic.AddInt64(&noGoCode, 1)           // module count of no .go files
+				atomic.AddUint64(&nonGoSize, totalSize) // no .go files counted
 				for ext, size := range exts {
 					v, found := sizePerExt.Load(ext)
 					if !found {
@@ -295,18 +297,27 @@ func main() {
 				}
 
 				// If the module itself isn't at
-				// least 100MiB, don't log more
+				// least 537MiB, don't log more
 				// details about it.
-				if sum>>26 < 1 {
+				if totalSize>>29 < 1 {
 					return nil
+				}
+
+				sort.Slice(ls, func(i, j int) bool {
+					return ls[i][1].(uint64) > ls[j][1].(uint64)
+				})
+				files := make([]string, len(ls))
+				for i, vals2 := range ls {
+					mib := float64(vals2[1].(uint64)) / float64(1<<20)
+					files[i] = fmt.Sprintf("[%4.0f MiB] %s", mib, vals2[0].(string))
 				}
 
 				outMu.Lock()
 				defer outMu.Unlock()
 
 				dlog.Printf("module: %q", modVers)
-				dlog.Printf("num_files: %d", len(files))
-				dlog.Printf("mod_size: %d", size)
+				dlog.Printf("num_files: %d", len(ls))
+				dlog.Printf("mod_size: %d B", size)
 				list := make([]string, 0, len(exts))
 				for ext := range exts {
 					list = append(list, fmt.Sprintf("%q", ext))
@@ -403,17 +414,19 @@ func main() {
 		return extSize[i][1].(uint64) > extSize[j][1].(uint64)
 	})
 
-	// Preview to stderr
+	// Preview to stderr.
 	const N = 20
-	fmt.Fprintf(os.Stderr, "Top-%d Size by Extension:\n", N)
+	fmt.Fprintf(os.Stderr, "Top-%d Size by Extension (across all Go-less modules):\n", N)
 	for _, vals2 := range extSize[:N] {
-		fmt.Fprintf(os.Stderr, "    %-30s    %.1f GiB\n", vals2[0].(string), float64(vals2[1].(uint64))/float64(1<<30))
+		fmt.Fprintf(os.Stderr, "    %-30s %5.1f GiB\n",
+			vals2[0].(string), float64(vals2[1].(uint64))/float64(1<<30))
 	}
 
 	// Dump the full statistics to logfile.
 	metadata := make([]string, len(extSize))
 	for i, vals2 := range extSize {
-		metadata[i] = fmt.Sprintf("%-30s    %.3f GiB", vals2[0].(string), float64(vals2[1].(uint64))/float64(1<<30))
+		metadata[i] = fmt.Sprintf("%-30s    %.3f GiB",
+			vals2[0].(string), float64(vals2[1].(uint64))/float64(1<<30))
 	}
 	dlog.Printf("File Ext by Size (n=%d):\n\t%s\n", len(metadata), strings.Join(metadata, "\n\t"))
 
@@ -421,7 +434,9 @@ func main() {
 	fmt.Fprintf(os.Stderr, "Used index version %q.\n", *index)
 	fmt.Fprintf(os.Stderr, "Downloaded %d bytes (%d from GCS).\n", allBytes, gcsBytes)
 	fmt.Fprintf(os.Stderr, "Wrote %d Go files (%d bytes).\n", goFiles, goBytes)
-	fmt.Fprintf(os.Stderr, "Module Proxy is saturated with %.2f%% Go modules containing non-Go files.\n", (nonGoGiB/float64(allBytes))*100)
+	totalGiB := (float64(allBytes) / float64(1<<30))
+	fmt.Fprintf(os.Stderr, "Module Proxy is saturated with %.2f%% Go-less modules.\n",
+		(nonGoGiB/totalGiB)*100)
 
 	if *memprofile != "" {
 		f, err := os.Create(*memprofile)
