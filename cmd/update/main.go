@@ -185,12 +185,12 @@ func main() {
 	// logs.txt has a loose structure
 	// that documents large modules
 	// that contain no .go files.
-	fd, err := os.Create("logs.txt")
+	lf, err := os.Create("data/mois.txt") // 'modules of interest'
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer fd.Close()
-	dlog := log.New(fd, "", os.O_RDWR)
+	defer lf.Close()
+	dlog := log.New(lf, "", os.O_RDWR)
 	dlog.SetFlags(0)
 
 	bar = pbTemplate.Start(len(indexCache.Latest)).Set("prefix", "Fetching modules...")
@@ -232,6 +232,7 @@ func main() {
 				atomic.AddInt64(&vendor, 1)
 				return nil
 			}
+			// TODO(nealpatel): Investigate what makes these spam.
 			if strings.HasPrefix(path, "github.com/bbiswy/") ||
 				strings.HasPrefix(path, "github.com/wMc27rFqQaH7tQxv3/") {
 				atomic.AddInt64(&spam, 1)
@@ -341,16 +342,10 @@ func main() {
 
 			// Go modules containing 0% Go content.
 			if !hasGoFiles {
-				atomic.AddInt64(&noGoCode, 1)           // module count of no .go files
-				atomic.AddUint64(&nonGoSize, totalSize) // no .go files counted
+				atomic.AddInt64(&noGoCode, 1)
+				atomic.AddUint64(&nonGoSize, totalSize)
 				for ext, size := range exts {
-					v, found := sizePerExt.Load(ext)
-					if !found {
-						c := &atomic.Uint64{}
-						c.Add(size)
-						sizePerExt.Store(ext, c)
-						v, _ = sizePerExt.Load(ext)
-					}
+					v, _ := sizePerExt.LoadOrStore(ext, (&atomic.Uint64{}))
 					v.(*atomic.Uint64).Add(size)
 				}
 
@@ -361,9 +356,11 @@ func main() {
 					return nil
 				}
 
+				// Descending sort the files by size.
 				sort.Slice(ls, func(i, j int) bool {
 					return ls[i][1].(uint64) > ls[j][1].(uint64)
 				})
+
 				files := make([]string, len(ls))
 				for i, vals2 := range ls {
 					mib := float64(vals2[1].(uint64)) / float64(1<<20)
