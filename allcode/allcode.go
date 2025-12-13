@@ -68,10 +68,12 @@ var (
 
 func main() {
 	gob.Register(map[string]string{})
+	gob.Register(time.Time{})
+	gob.Register(IndexCache{})
+
 	cpuprofile := flag.String("cpuprofile", "", "write cpu profile to `FILE`")
 	memprofile := flag.String("memprofile", "", "write memory profile to `FILE`")
 	compress := flag.Bool("z", false, "compress the output tar archive with gzip")
-	index := flag.String("file", "", "read module index from `FILE`")
 	all := flag.Bool("all", false, "include potential forks (mismatching and missing go.mod)")
 	flag.Parse()
 
@@ -91,32 +93,88 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
-	var latestVersions map[string]string
+	var indexCache IndexCache
 	var bar *pb.ProgressBar
 
-	// Either fetch and cache a fresh index,
-	// or use a cached version of a previous
-	// index.
-	if *index == "" {
-		latestVersions = fetchIndex(ctx, bar)
-		// cache it after fetching
-		*index = fmt.Sprintf("data/%s_index.gob", time.Now().Format("2006-01-02"))
-		f, err := os.Create(*index)
+	// If data directory does not exist,
+	// create it for caching.
+	_, err := os.Stat("data")
+	switch err {
+	case nil:
+	case os.ErrNotExist:
+		if err := os.Mkdir("data", 0755); err != nil {
+			log.Fatalf("cannot mkdir: %v", err)
+		}
+	default:
+		log.Fatalf("cannot stat: %v", err)
+	}
+
+	// Backup the current HEAD if it
+	// already exists.
+	const head = "data/HEAD.index"
+	_, err = os.Stat(head)
+	switch err {
+	case nil:
+		// Read the current HEAD.
+		file, err := os.ReadFile(head)
+		if err != nil {
+			log.Fatalf("cannot read %q: %v", head, err)
+		}
+		buf := bytes.NewBuffer(file)
+		gob.NewDecoder(buf).Decode(&indexCache)
+
+		// Backup the previous HEAD.
+		f, err := os.Create(fmt.Sprintf("data/HEAD.%s.index", indexCache.UpdatedAt.Format("20060102_150405")))
 		if err != nil {
 			log.Fatal(err)
 		}
-		if err = gob.NewEncoder(f).Encode(latestVersions); err != nil {
-			log.Printf("could not encode index: %v", err)
+		defer f.Close()
+		if err = gob.NewEncoder(f).Encode(indexCache); err != nil {
+			log.Panicf("could backup %s: %v", head, err)
 		}
-	} else {
-		file, err := os.ReadFile(*index)
-		if err != nil {
-			log.Fatalf("cannot read %q: %v", *index, err)
+		if err = os.Remove(head); err != nil {
+			log.Fatalf("cannot remove %s: %v", head, err)
 		}
-		buf := bytes.NewBuffer(file)
-		gob.NewDecoder(buf).Decode(&latestVersions)
+
+	case os.ErrNotExist:
+		// If it doesn't exist, initialize
+		// a blank cache to be updated.
+		indexCache = IndexCache{Latest: make(map[string]string)}
+
+	default:
+		log.Fatalf("cannot stat data/HEAD.index: %v", err)
 	}
 
+	updateIndex(ctx, bar, &indexCache)
+
+	// Cache the updated index as HEAD.index
+	f, err := os.Create(head)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer f.Close()
+	if err = gob.NewEncoder(f).Encode(indexCache); err != nil {
+		log.Panicf("could not encode index: %v", err)
+	}
+
+	// TODO(nealpatel): Write a diff'ing
+	// mechanism can be used to ensure
+	// that only modules with versions
+	// that changed since the last index
+	// update are fetched and cached.
+	_ = 0
+
+	// TODO(nealpatel): Consider how an
+	// auxillary tool can be used to
+	// prune non-latest versions from a
+	// cache that gets incrementally
+	// updated.
+	_ = 1
+
+	// Once the index has been created
+	// or updated, start walking all
+	// of the modules and writing them
+	// to the desired output location.
 	outMu := &sync.Mutex{}
 	var out io.WriteCloser = os.Stdout
 	if *compress {
@@ -135,7 +193,7 @@ func main() {
 	dlog := log.New(fd, "", os.O_RDWR)
 	dlog.SetFlags(0)
 
-	bar = pbTemplate.Start(len(latestVersions)).Set("prefix", "Fetching modules...")
+	bar = pbTemplate.Start(len(indexCache.Latest)).Set("prefix", "Fetching modules...")
 
 	// TODO: Change to use a channel, the
 	// weights are never used. Also, change
@@ -147,7 +205,7 @@ func main() {
 	// Metadata for the files.
 	var sizePerExt sync.Map
 
-	for path, version := range latestVersions {
+	for path, version := range indexCache.Latest {
 		if err := ctx.Err(); err != nil {
 			bar.Finish()
 			log.Println(err)
@@ -385,7 +443,7 @@ func main() {
 	bar.Finish()
 
 	fmt.Fprintf(os.Stderr, "\n")
-	fmt.Fprintf(os.Stderr, "Unique modules:       % 7d\n", len(latestVersions))
+	fmt.Fprintf(os.Stderr, "Unique modules:       % 7d\n", len(indexCache.Latest))
 	fmt.Fprintf(os.Stderr, "Vendor paths:         % 7d\n", vendor)
 	fmt.Fprintf(os.Stderr, "Spam:                 % 7d\n", spam)
 	fmt.Fprintf(os.Stderr, "Invalid names:        % 7d\n", invalidName)
@@ -431,7 +489,7 @@ func main() {
 	dlog.Printf("File Ext by Size (n=%d):\n\t%s\n", len(metadata), strings.Join(metadata, "\n\t"))
 
 	fmt.Fprintf(os.Stderr, "\n")
-	fmt.Fprintf(os.Stderr, "Used index version %q.\n", *index)
+	fmt.Fprintf(os.Stderr, "Used index with updated at %s.\n", indexCache.UpdatedAt.Format("2006-01-02 15:04:05 MST"))
 	fmt.Fprintf(os.Stderr, "Downloaded %d bytes (%d from GCS).\n", allBytes, gcsBytes)
 	fmt.Fprintf(os.Stderr, "Wrote %d Go files (%d bytes).\n", goFiles, goBytes)
 	totalGiB := (float64(allBytes) / float64(1<<30))
@@ -451,18 +509,17 @@ func main() {
 	}
 }
 
-func newRequestWithContext(ctx context.Context, method, url string) *http.Request {
-	req, err := http.NewRequestWithContext(ctx, method, url, nil)
-	if err != nil {
-		panic(err)
-	}
-	return req
+type IndexCache struct {
+	Latest        map[string]string
+	UpdatedAt     time.Time
+	TotalVersions uint64
 }
 
-// fetchIndex gets the current module index
-// from sum.golang.org that is required to
-// walk and download Go modules.
-func fetchIndex(ctx context.Context, bar *pb.ProgressBar) map[string]string {
+// updateIndex gets the incremental diff
+// between the provided cache and the
+// current module index from sum.golang.org
+// and updates the cache in-place.
+func updateIndex(ctx context.Context, bar *pb.ProgressBar, cache *IndexCache) {
 	latest, err := fetchLatest(ctx)
 	if err != nil {
 		log.Fatal(err)
@@ -471,12 +528,26 @@ func fetchIndex(ctx context.Context, bar *pb.ProgressBar) map[string]string {
 	if err != nil {
 		log.Fatal(err)
 	}
-	bar = pbTemplate.Start64(tree.N).Set("prefix", "Fetching index...")
-	latestVersions := make(map[string]string)
-	i, err := NewIndex(ctx)
-	if err != nil {
-		log.Fatal(err)
+	N := tree.N - int64(cache.TotalVersions)
+
+	if N <= 0 {
+		const cacheFmt = "\tLatest: %d\n\tTotal Versions: %d\n\tUpdatedAt: %s"
+		log.Printf("no updates for index\n{\n%s\n}",
+			fmt.Sprintf(cacheFmt,
+				len(cache.Latest),
+				cache.TotalVersions,
+				cache.UpdatedAt.Format("2006-01-02 15:04:05 UTC")),
+		)
+		return
 	}
+	bar = pbTemplate.Start64(N).Set("prefix", "Updating index...")
+
+	// Create a new Index walker using
+	// the previously cached timestamp.
+	start := time.Now()
+	i := NewIndex(ctx, cache.UpdatedAt)
+	cache.UpdatedAt = start
+	cache.TotalVersions = uint64(tree.N)
 
 	var linesSeen uint64
 	for {
@@ -490,40 +561,25 @@ func fetchIndex(ctx context.Context, bar *pb.ProgressBar) map[string]string {
 		linesSeen++
 		bar.Increment()
 
-		if semver.Compare(v.Version, latestVersions[v.Path]) >= 0 {
-			latestVersions[v.Path] = v.Version
+		if semver.Compare(v.Version, cache.Latest[v.Path]) >= 0 {
+			cache.Latest[v.Path] = v.Version
 		}
 	}
+
 	bar.Finish()
-	return latestVersions
+}
+
+func NewIndex(ctx context.Context, lastUpdate time.Time) *Index {
+	i := &Index{last: lastUpdate}
+	if err := i.nextPage(ctx); err != nil {
+		panic(err)
+	}
+	return i
 }
 
 type Index struct {
 	last time.Time
 	d    *json.Decoder
-}
-
-func NewIndex(ctx context.Context) (*Index, error) {
-	i := &Index{}
-	if err := i.nextPage(ctx); err != nil {
-		return nil, err
-	}
-	return i, nil
-}
-
-func (i *Index) nextPage(ctx context.Context) error {
-	url := "https://index.golang.org/index?since=" + i.last.Add(1).Format(time.RFC3339Nano)
-	req, err := httpClient.Do(newRequestWithContext(ctx, "GET", url))
-	if err != nil {
-		return err
-	}
-	i.d = json.NewDecoder(req.Body)
-	return nil
-}
-
-type Version struct {
-	Path, Version string
-	Timestamp     time.Time
 }
 
 func (i *Index) next(ctx context.Context) (*Version, error) {
@@ -540,6 +596,29 @@ func (i *Index) next(ctx context.Context) (*Version, error) {
 	}
 	i.last = v.Timestamp
 	return v, nil
+}
+
+func (i *Index) nextPage(ctx context.Context) error {
+	url := "https://index.golang.org/index?since=" + i.last.Add(1).Format(time.RFC3339Nano)
+	req, err := httpClient.Do(newRequestWithContext(ctx, "GET", url))
+	if err != nil {
+		return err
+	}
+	i.d = json.NewDecoder(req.Body)
+	return nil
+}
+
+func newRequestWithContext(ctx context.Context, method, url string) *http.Request {
+	req, err := http.NewRequestWithContext(ctx, method, url, nil)
+	if err != nil {
+		panic(err)
+	}
+	return req
+}
+
+type Version struct {
+	Path, Version string
+	Timestamp     time.Time
 }
 
 func fetchLatest(ctx context.Context) ([]byte, error) {
