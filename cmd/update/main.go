@@ -137,8 +137,7 @@ func main() {
 		}
 
 	case os.ErrNotExist:
-		// If it doesn't exist, initialize
-		// a blank cache to be updated.
+		log.Printf("no ./data/HEAD.index found; building new HEAD from scratch (this may take a while)")
 		indexCache = IndexCache{Latest: make(map[string]string)}
 
 	default:
@@ -312,6 +311,8 @@ func main() {
 			ls := make([][2]any, 0, len(z.File))
 			exts := make(map[string]uint64)
 			modVers := path + "@" + version
+
+			// Walk through the files in the zip.
 			for _, f := range z.File {
 				_, localName, _ := strings.Cut(f.Name, modVers)
 
@@ -362,9 +363,9 @@ func main() {
 				})
 
 				files := make([]string, len(ls))
-				for i, vals2 := range ls {
-					mib := float64(vals2[1].(uint64)) / float64(1<<20)
-					files[i] = fmt.Sprintf("[%4.0f MiB] %s", mib, vals2[0].(string))
+				for i, any2 := range ls {
+					mib := float64(any2[1].(uint64)) / float64(1<<20)
+					files[i] = fmt.Sprintf("[%4.0f MiB] %s", mib, any2[0].(string))
 				}
 
 				outMu.Lock()
@@ -391,6 +392,7 @@ func main() {
 				return nil
 			}
 
+			// Modules are good to save.
 			atomic.AddInt64(&good, 1)
 			outMu.Lock()
 			defer outMu.Unlock()
@@ -440,22 +442,22 @@ func main() {
 	bar.Finish()
 
 	fmt.Fprintf(os.Stderr, "\n")
-	fmt.Fprintf(os.Stderr, "Unique modules:       % 7d\n", len(indexCache.Latest))
-	fmt.Fprintf(os.Stderr, "Vendor paths:         % 7d\n", vendor)
-	fmt.Fprintf(os.Stderr, "Spam:                 % 7d\n", spam)
-	fmt.Fprintf(os.Stderr, "Invalid names:        % 7d\n", invalidName)
-	fmt.Fprintf(os.Stderr, "Gone:                 % 7d\n", gone)
-	fmt.Fprintf(os.Stderr, "Nil:                  % 7d\n", nilModOrModule)
-	fmt.Fprintf(os.Stderr, "Unknown:              % 7d\n", unknown)
-	fmt.Fprintf(os.Stderr, "Invalid go.mod:       % 7d\n", invalidGoMod)
+	fmt.Fprintf(os.Stderr, "Unique modules:       % 9d\n", len(indexCache.Latest))
+	fmt.Fprintf(os.Stderr, "Vendor paths:         % 9d\n", vendor)
+	fmt.Fprintf(os.Stderr, "Spam:                 % 9d\n", spam)
+	fmt.Fprintf(os.Stderr, "Invalid names:        % 9d\n", invalidName)
+	fmt.Fprintf(os.Stderr, "Gone:                 % 9d\n", gone)
+	fmt.Fprintf(os.Stderr, "Nil:                  % 9d\n", nilModOrModule)
+	fmt.Fprintf(os.Stderr, "Unknown:              % 9d\n", unknown)
+	fmt.Fprintf(os.Stderr, "Invalid go.mod:       % 9d\n", invalidGoMod)
 	if !*all {
-		fmt.Fprintf(os.Stderr, "Mismatching go.mod:   % 7d -\n", mismatchedGoMod)
-		fmt.Fprintf(os.Stderr, "No go.mod file:       % 7d -\n", noGoMod)
+		fmt.Fprintf(os.Stderr, "Mismatching go.mod:   % 9d\n", mismatchedGoMod)
+		fmt.Fprintf(os.Stderr, "No go.mod file:       % 9d\n", noGoMod)
 	}
 	nonGoGiB := float64(nonGoSize) / float64(1<<30)
-	fmt.Fprintf(os.Stderr, "No .go files:         % 7d (%.1f GiB)\n", noGoCode, nonGoGiB)
+	fmt.Fprintf(os.Stderr, "No .go files:         % 9d (%.1f GiB)\n", noGoCode, nonGoGiB)
 	fmt.Fprintf(os.Stderr, "                      -------\n")
-	fmt.Fprintf(os.Stderr, "Valid:                % 7d\n", good)
+	fmt.Fprintf(os.Stderr, "Valid:                % 9d\n", good)
 
 	// Extract and sort the per-extension size.
 	var extSize [][2]any
@@ -472,16 +474,16 @@ func main() {
 	// Preview to stderr.
 	const N = 20
 	fmt.Fprintf(os.Stderr, "Top-%d Size by Extension (across all Go-less modules):\n", N)
-	for _, vals2 := range extSize[:N] {
+	for _, any2 := range extSize[:N] {
 		fmt.Fprintf(os.Stderr, "    %-30s %5.1f GiB\n",
-			vals2[0].(string), float64(vals2[1].(uint64))/float64(1<<30))
+			any2[0].(string), float64(any2[1].(uint64))/float64(1<<30))
 	}
 
 	// Dump the full statistics to logfile.
 	metadata := make([]string, len(extSize))
-	for i, vals2 := range extSize {
+	for i, any2 := range extSize {
 		metadata[i] = fmt.Sprintf("%-30s    %.3f GiB",
-			vals2[0].(string), float64(vals2[1].(uint64))/float64(1<<30))
+			any2[0].(string), float64(any2[1].(uint64))/float64(1<<30))
 	}
 	dlog.Printf("File Ext by Size (n=%d):\n\t%s\n", len(metadata), strings.Join(metadata, "\n\t"))
 

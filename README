@@ -1,3 +1,5 @@
+$ go run ./cmd/update -all -z > gomodcache.$(date -u +"%Y-%m-%d").tar.gz
+
 This repository was originally a set of patches on a fork over https://github.com/FiloSottile/mostly-harmless/tree/main/allcode. All previous patches and the original code have been preserved in this repository's history.
 
 Since this repository has diverged in functionality and the previous upstream contains more than just this particular module, it is forked here under a new name.
