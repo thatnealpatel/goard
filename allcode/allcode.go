@@ -21,6 +21,7 @@ import (
 	"os/signal"
 	"runtime"
 	"runtime/pprof"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -61,6 +62,8 @@ var (
 	goBytes         int64
 	allBytes        int64
 	goFiles         int64
+
+	nonGoSize uint64
 )
 
 func main() {
@@ -93,6 +96,15 @@ func main() {
 
 	if *index == "" {
 		latestVersions = fetchIndex(ctx, bar)
+		// cache it after fetching
+		*index = fmt.Sprintf("data/%s_index.gob", time.Now().Format("2006-01-02"))
+		f, err := os.Create(*index)
+		if err != nil {
+			log.Fatal(err)
+		}
+		if err = gob.NewEncoder(f).Encode(latestVersions); err != nil {
+			log.Printf("could not encode index: %v", err)
+		}
 	} else {
 		file, err := os.ReadFile(*index)
 		if err != nil {
@@ -109,10 +121,33 @@ func main() {
 	}
 	tw := tar.NewWriter(out)
 
+	fd, err := os.Create("logs.txt")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer fd.Close()
+	dlog := log.New(fd, "", os.O_RDWR)
+	dlog.SetFlags(0)
+
+	fd2, err := os.Create("sus.txt")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer fd2.Close()
+	suslog := log.New(fd2, "", os.O_RDWR)
+	suslog.SetFlags(0)
+
 	bar = pbTemplate.Start(len(latestVersions)).Set("prefix", "Fetching modules...")
-	sem := semaphore.NewWeighted(200)
-	gcp := semaphore.NewWeighted(500) // GCS can take it, and it's way way slower
+
+	// TODO: Change to use a channel, the
+	// weights are never used. Also, change
+	// errgroup to sync.WaitGroup.
+	sem := semaphore.NewWeighted(250)  // +50
+	gcp := semaphore.NewWeighted(1000) // +500 (GCS is slow and can take the QPS)
 	g, ctx := errgroup.WithContext(ctx)
+
+	// Metadata for the files.
+	var sizePerExt sync.Map
 
 	for path, version := range latestVersions {
 		if err := ctx.Err(); err != nil {
@@ -216,7 +251,19 @@ func main() {
 
 			var hasGoMod, hasGoFiles bool
 			var extractedSize uint64
+			files := make([]string, 0, len(z.File))
+			sizes := make([]uint64, 0, len(z.File))
+			exts := make(map[string]uint64)
+			modVers := path + "@" + version
 			for _, f := range z.File {
+				files = append(files, f.Name)
+				sizes = append(sizes, f.UncompressedSize64)
+				_, localName, _ := strings.Cut(f.Name, modVers)
+				idx := strings.LastIndex(localName, ".")
+				if idx >= 0 && idx+1 < len(localName) {
+					exts[localName[idx+1:]] += f.UncompressedSize64
+				}
+
 				if strings.HasSuffix(f.Name, ".go") {
 					hasGoFiles = true
 				}
@@ -227,16 +274,58 @@ func main() {
 					extractedSize += f.UncompressedSize64
 				}
 			}
+
+			// Go modules containing 0% Go content.
 			if !hasGoFiles {
 				atomic.AddInt64(&noGoCode, 1)
+				var sum uint64
+				for _, size := range sizes {
+					sum += size
+				}
+				atomic.AddUint64(&nonGoSize, sum)
+				for ext, size := range exts {
+					v, found := sizePerExt.Load(ext)
+					if !found {
+						c := &atomic.Uint64{}
+						c.Add(size)
+						sizePerExt.Store(ext, c)
+						v, _ = sizePerExt.Load(ext)
+					}
+					v.(*atomic.Uint64).Add(size)
+				}
+
+				// If the module itself isn't at
+				// least 100MiB, don't log more
+				// details about it.
+				if sum>>26 < 1 {
+					return nil
+				}
+
+				outMu.Lock()
+				defer outMu.Unlock()
+
+				dlog.Printf("module: %q", modVers)
+				dlog.Printf("num_files: %d", len(files))
+				dlog.Printf("mod_size: %d", size)
+				list := make([]string, 0, len(exts))
+				for ext := range exts {
+					list = append(list, fmt.Sprintf("%q", ext))
+				}
+				dlog.Printf("num_extensions: %d", len(list))
+				// This format allows for easy folding in vim.
+				dlog.Printf("extensions {\n\t%s\n}", strings.Join(list, "\n\t"))
+				dlog.Printf("files {\n\t%s\n}", strings.Join(files, "\n\t"))
+				dlog.Printf("\n\n")
 				return nil
 			}
+
+			// Potentially old Go modules.
 			if !hasGoMod && !*all {
 				atomic.AddInt64(&noGoMod, 1)
 				return nil
 			}
-			atomic.AddInt64(&good, 1)
 
+			atomic.AddInt64(&good, 1)
 			outMu.Lock()
 			defer outMu.Unlock()
 			for _, f := range z.File {
@@ -281,27 +370,58 @@ func main() {
 	if err := out.Close(); err != nil {
 		log.Println(err)
 	}
+
 	bar.Finish()
 
 	fmt.Fprintf(os.Stderr, "\n")
-	fmt.Fprintf(os.Stderr, "Unique modules:       % 7d -\n", len(latestVersions))
-	fmt.Fprintf(os.Stderr, "Vendor paths:         % 7d -\n", vendor)
-	fmt.Fprintf(os.Stderr, "Spam:                 % 7d -\n", spam)
-	fmt.Fprintf(os.Stderr, "Invalid names:        % 7d -\n", invalidName)
-	fmt.Fprintf(os.Stderr, "Gone:                 % 7d -\n", gone)
-	fmt.Fprintf(os.Stderr, "Nil:                  % 7d -\n", nilModOrModule)
-	fmt.Fprintf(os.Stderr, "Unknown:              % 7d -\n", unknown)
-	fmt.Fprintf(os.Stderr, "Invalid go.mod files: % 7d -\n", invalidGoMod)
+	fmt.Fprintf(os.Stderr, "Unique modules:       % 7d\n", len(latestVersions))
+	fmt.Fprintf(os.Stderr, "Vendor paths:         % 7d\n", vendor)
+	fmt.Fprintf(os.Stderr, "Spam:                 % 7d\n", spam)
+	fmt.Fprintf(os.Stderr, "Invalid names:        % 7d\n", invalidName)
+	fmt.Fprintf(os.Stderr, "Gone:                 % 7d\n", gone)
+	fmt.Fprintf(os.Stderr, "Nil:                  % 7d\n", nilModOrModule)
+	fmt.Fprintf(os.Stderr, "Unknown:              % 7d\n", unknown)
+	fmt.Fprintf(os.Stderr, "Invalid go.mod:       % 7d\n", invalidGoMod)
 	if !*all {
 		fmt.Fprintf(os.Stderr, "Mismatching go.mod:   % 7d -\n", mismatchedGoMod)
 		fmt.Fprintf(os.Stderr, "No go.mod file:       % 7d -\n", noGoMod)
 	}
-	fmt.Fprintf(os.Stderr, "No .go files:         % 7d =\n", noGoCode)
+	nonGoGiB := float64(nonGoSize) / float64(1<<30)
+	fmt.Fprintf(os.Stderr, "No .go files:         % 7d (%.1f GiB)\n", noGoCode, nonGoGiB)
 	fmt.Fprintf(os.Stderr, "                      -------\n")
-	fmt.Fprintf(os.Stderr, "                      % 7d\n", good)
+	fmt.Fprintf(os.Stderr, "Valid:                % 7d\n", good)
+
+	// Extract and sort the per-extension size.
+	var extSize [][2]any
+	sizePerExt.Range(func(key, value any) bool {
+		ext, _ := key.(string)
+		c, _ := value.(*atomic.Uint64)
+		extSize = append(extSize, [2]any{ext, c.Load()})
+		return true
+	})
+	sort.Slice(extSize, func(i, j int) bool {
+		return extSize[i][1].(uint64) > extSize[j][1].(uint64)
+	})
+
+	// Preview to stderr
+	const N = 20
+	fmt.Fprintf(os.Stderr, "Top-%d Size by Extension:\n", N)
+	for _, vals2 := range extSize[:N] {
+		fmt.Fprintf(os.Stderr, "    %-30s    %.1f GiB\n", vals2[0].(string), float64(vals2[1].(uint64))/float64(1<<30))
+	}
+
+	// Dump the full statistics to logfile.
+	metadata := make([]string, len(extSize))
+	for i, vals2 := range extSize {
+		metadata[i] = fmt.Sprintf("%-30s    %.3f GiB", vals2[0].(string), float64(vals2[1].(uint64))/float64(1<<30))
+	}
+	dlog.Printf("File Ext by Size (n=%d):\n\t%s\n", len(metadata), strings.Join(metadata, "\n\t"))
+
 	fmt.Fprintf(os.Stderr, "\n")
+	fmt.Fprintf(os.Stderr, "Used index version %q.\n", *index)
 	fmt.Fprintf(os.Stderr, "Downloaded %d bytes (%d from GCS).\n", allBytes, gcsBytes)
 	fmt.Fprintf(os.Stderr, "Wrote %d Go files (%d bytes).\n", goFiles, goBytes)
+	fmt.Fprintf(os.Stderr, "Module Proxy is saturated with %.2f%% Go modules containing non-Go files.\n", (nonGoGiB/float64(allBytes))*100)
 
 	if *memprofile != "" {
 		f, err := os.Create(*memprofile)
@@ -360,17 +480,6 @@ func fetchIndex(ctx context.Context, bar *pb.ProgressBar) map[string]string {
 		}
 	}
 	bar.Finish()
-
-	const defaultFilePath = "latest_versions.gob"
-	file, err := os.Create(defaultFilePath)
-	if err != nil {
-		log.Printf("failed to create file: %v", err)
-	}
-	defer file.Close()
-	if err := gob.NewEncoder(file).Encode(&latestVersions); err != nil {
-		log.Printf("failed to encode %s: %v", defaultFilePath, err)
-	}
-
 	return latestVersions
 }
 
