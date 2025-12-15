@@ -1,6 +1,6 @@
 module github.com/thatnealpatel/goard
 
-go 1.24.0
+go 1.25.5
 
 require (
 	github.com/cheggaaa/pb/v3 v3.1.7
