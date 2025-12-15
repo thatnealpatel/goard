@@ -35,8 +35,6 @@ import (
 	"golang.org/x/mod/module"
 	"golang.org/x/mod/semver"
 	"golang.org/x/mod/sumdb/tlog"
-	"golang.org/x/sync/errgroup"
-	"golang.org/x/sync/semaphore"
 )
 
 var httpClient = &http.Client{
@@ -49,31 +47,28 @@ var httpClient = &http.Client{
 var pbTemplate pb.ProgressBarTemplate = `{{string . "prefix"}} {{counters . }} {{bar . }} {{percent . }} {{etime . }}`
 
 var (
-	// TODO: Use atomics instead?
-	gone            int64
-	unknown         int64
-	nilModOrModule  int64
-	invalidName     int64
-	vendor          int64
-	spam            int64
-	mismatchedGoMod int64
-	invalidGoMod    int64
-	noGoCode        int64
-	noGoMod         int64
-	gcsBytes        int64
-	good            int64
-	goBytes         int64
-	allBytes        int64
-	goFiles         int64
-	alreadyExists   int64
-
-	nonGoSize uint64
+	gone            atomic.Int64
+	unknown         atomic.Int64
+	nilModOrModule  atomic.Int64
+	invalidName     atomic.Int64
+	vendor          atomic.Int64
+	spam            atomic.Int64
+	mismatchedGoMod atomic.Int64
+	invalidGoMod    atomic.Int64
+	noGoCode        atomic.Int64
+	noGoMod         atomic.Int64
+	gcsBytes        atomic.Int64
+	good            atomic.Int64
+	goBytes         atomic.Int64
+	allBytes        atomic.Int64
+	goFiles         atomic.Int64
+	nonGoSize       atomic.Uint64
 
 	// Since goBytes and goFiles count
 	// all the extensions in ignoreFile
 	// it's not a true representation.
-	onlyGoSrcFiles     uint64
-	onlyGoSrcFilesSize uint64
+	onlyGoSrcFiles     atomic.Int64
+	onlyGoSrcFilesSize atomic.Uint64
 )
 
 // localGoModCache is the top-level
@@ -110,7 +105,7 @@ func main() {
 
 	var bar *pb.ProgressBar
 
-	log.Println("local gomodcache: ", localGoModCache)
+	log.Println("Using local go module cache: ", localGoModCache)
 
 	// If data/HEAD.index exists, it
 	// will be read, backed up, updated,
@@ -151,22 +146,19 @@ func main() {
 	dlog := log.New(lf, "", os.O_RDWR)
 	dlog.SetFlags(0)
 
-	// TODO(nealpatel): Change to use
-	// channels since weights are not
-	// used; also use a wg instead of
-	// the errgroup.
-	sem := semaphore.NewWeighted(250)  // originally 200
-	gcp := semaphore.NewWeighted(1500) // originally 500 (GCS is slow and can take the QPS)
-	g, ctx := errgroup.WithContext(ctx)
-
 	// Metadata for the files.
 	var sizePerExt sync.Map
-
 	bar = pbTemplate.Start(len(indexCache.Latest)).Set("prefix", "Fetching modules...")
+
+	var wg sync.WaitGroup
+	upstreamSem := make(chan struct{}, 250)
+	gcpSem := make(chan struct{}, 1500)
+
+	var alreadyExists int64
 	for path, version := range indexCache.Latest {
 		if err := ctx.Err(); err != nil {
 			bar.Finish()
-			log.Println(err)
+			log.Println(path, version, err)
 			break
 		}
 
@@ -178,60 +170,53 @@ func main() {
 			continue
 		}
 
-		if err := sem.Acquire(ctx, 1); err != nil {
-			bar.Finish()
-			log.Println(err)
-			break
-		}
-
-		// TODO(nealpatel): Can remove this?
-		path, version := path, version
-		g.Go(func() error {
+		upstreamSem <- struct{}{}
+		wg.Go(func() {
 			releaseOnce := &sync.Once{}
-			defer releaseOnce.Do(func() { sem.Release(1) })
+			defer releaseOnce.Do(func() { <-upstreamSem })
 			defer bar.Increment()
 
 			if strings.Contains(path, "/vendor/") ||
 				strings.Contains(path, "/kubernetes/staging/") {
-				atomic.AddInt64(&vendor, 1)
-				return nil
+				vendor.Add(1)
+				return
 			}
 
 			// TODO(nealpatel): Investigate what makes these spam.
 			if strings.HasPrefix(path, "github.com/bbiswy/") ||
 				strings.HasPrefix(path, "github.com/wMc27rFqQaH7tQxv3/") {
-				atomic.AddInt64(&spam, 1)
-				return nil
+				spam.Add(1)
+				return
 			}
 
 			modBytes, err := fetchMod(ctx, path, version)
 			switch err {
 			case errorInvalidName:
-				atomic.AddInt64(&invalidName, 1)
-				return nil
+				invalidName.Add(1)
+				return
 			case errorGone:
-				atomic.AddInt64(&gone, 1)
-				return nil
+				gone.Add(1)
+				return
 			default:
-				atomic.AddInt64(&unknown, 1)
-				return nil
+				unknown.Add(1)
+				return
 			case nil:
 			}
 
 			mod, err := modfile.ParseLax(path+"@"+version, modBytes, nil)
 			switch {
 			case err != nil:
-				atomic.AddInt64(&invalidGoMod, 1)
-				return nil
+				invalidGoMod.Add(1)
+				return
 			case mod == nil || mod.Module == nil:
 				// Without this invariant, panic at runtime happens:
 				// e.g. github.com/Maka8ka/Faygo/client@v0.0.0-20220420085059-439b6b39f779
 				// e.g. github.com/maka8ka/faygo/client@v0.0.0-20220420085059-439b6b39f779
-				atomic.AddInt64(&nilModOrModule, 1)
-				return nil
+				nilModOrModule.Add(1)
+				return
 			case mod.Module.Mod.Path != path && !*all:
-				atomic.AddInt64(&mismatchedGoMod, 1)
-				return nil
+				mismatchedGoMod.Add(1)
+				return
 			default:
 			}
 
@@ -239,21 +224,19 @@ func main() {
 			switch err {
 			case nil:
 			case errorGone:
-				atomic.AddInt64(&gone, 1)
-				return nil
+				gone.Add(1)
+				return
 			default:
-				atomic.AddInt64(&unknown, 1)
-				return nil
+				unknown.Add(1)
+				return
 			}
 
 			// Swap the sem based on the data source.
 			if strings.HasPrefix(url, "https://storage.googleapis.com/") {
-				atomic.AddInt64(&gcsBytes, size)
-				releaseOnce.Do(func() { sem.Release(1) })
-				if err := gcp.Acquire(ctx, 1); err != nil {
-					return err
-				}
-				defer gcp.Release(1)
+				gcsBytes.Add(size)
+				releaseOnce.Do(func() { <-upstreamSem })
+				gcpSem <- struct{}{}
+				defer func() { <-gcpSem }()
 			}
 
 			// Download the source zip for path@version.
@@ -261,19 +244,20 @@ func main() {
 			switch err {
 			case nil:
 			case errorGone:
-				atomic.AddInt64(&gone, 1)
-				return nil
+				gone.Add(1)
+				return
 			default:
-				atomic.AddInt64(&unknown, 1)
-				return nil
+				unknown.Add(1)
+				return
 			}
 
-			atomic.AddInt64(&allBytes, size)
+			allBytes.Add(size)
 
 			zipBytesReader := bytes.NewReader(zipBytes)
 			z, err := zip.NewReader(zipBytesReader, size)
 			if err != nil {
-				return err
+				log.Println(path, version, err)
+				return
 			}
 
 			var hasGoMod, hasGoFiles bool
@@ -302,8 +286,8 @@ func main() {
 				}
 
 				if strings.HasSuffix(f.Name, ".go") {
-					atomic.AddUint64(&onlyGoSrcFiles, 1)
-					atomic.AddUint64(&onlyGoSrcFilesSize, f.UncompressedSize64)
+					onlyGoSrcFiles.Add(1)
+					onlyGoSrcFilesSize.Add(f.UncompressedSize64)
 					hasGoFiles = true
 				}
 				if strings.HasSuffix(f.Name, "/go.mod") {
@@ -317,8 +301,8 @@ func main() {
 			// Go modules containing 0% Go content
 			// are very intersting.
 			if !hasGoFiles {
-				atomic.AddInt64(&noGoCode, 1)
-				atomic.AddUint64(&nonGoSize, totalSize)
+				noGoCode.Add(1)
+				nonGoSize.Add(totalSize)
 				for ext, size := range exts {
 					v, _ := sizePerExt.LoadOrStore(ext, (&atomic.Uint64{}))
 					v.(*atomic.Uint64).Add(size)
@@ -328,7 +312,7 @@ func main() {
 				// least 537MiB, don't log more
 				// details about it.
 				if totalSize>>29 < 1 {
-					return nil
+					return
 				}
 
 				// Descending sort the files by size.
@@ -357,15 +341,15 @@ func main() {
 				dlog.Printf("extensions {\n\t%s\n}", strings.Join(list, "\n\t"))
 				dlog.Printf("files {\n\t%s\n}", strings.Join(files, "\n\t"))
 				dlog.Printf("\n\n")
-				return nil
+				return
 			}
 
 			if !hasGoMod && !*all {
-				atomic.AddInt64(&noGoMod, 1)
-				return nil
+				noGoMod.Add(1)
+				return
 			}
 
-			atomic.AddInt64(&good, 1)
+			good.Add(1)
 
 			// TODO(nealpatel) perform incremental
 			// updates over the local cache.
@@ -382,7 +366,8 @@ func main() {
 
 				src, err := z.Open(f.Name)
 				if err != nil {
-					return err
+					log.Println(path, version, err)
+					return
 				}
 
 				hdr := &tar.Header{
@@ -391,26 +376,25 @@ func main() {
 					Size: int64(f.UncompressedSize64),
 				}
 				if err := tw.WriteHeader(hdr); err != nil {
-					return err
+					log.Println(path, version, err)
+					return
 				}
 
 				n, err := io.Copy(tw, src)
 				if err != nil {
-					return err
+					log.Println(path, version, err)
+					return
 				}
 
-				atomic.AddInt64(&goFiles, 1)
-				atomic.AddInt64(&goBytes, n)
+				goFiles.Add(1)
+				goBytes.Add(n)
 			}
-
-			return nil
 		})
 	}
 
-	if err := g.Wait(); err != nil {
-		bar.Finish()
-		log.Println(err)
-	}
+	wg.Wait()
+	bar.Finish()
+
 	if err := tw.Close(); err != nil {
 		log.Println(err)
 	}
@@ -423,21 +407,21 @@ func main() {
 	fmt.Fprintf(os.Stderr, "\n")
 	fmt.Fprintf(os.Stderr, "Unique modules:       % 9d\n", len(indexCache.Latest))
 	fmt.Fprintf(os.Stderr, "Already cached:       % 9d\n", alreadyExists)
-	fmt.Fprintf(os.Stderr, "Vendor paths:         % 9d\n", vendor)
-	fmt.Fprintf(os.Stderr, "Spam:                 % 9d\n", spam)
-	fmt.Fprintf(os.Stderr, "Invalid names:        % 9d\n", invalidName)
-	fmt.Fprintf(os.Stderr, "Gone:                 % 9d\n", gone)
-	fmt.Fprintf(os.Stderr, "Nil:                  % 9d\n", nilModOrModule)
-	fmt.Fprintf(os.Stderr, "Unknown:              % 9d\n", unknown)
-	fmt.Fprintf(os.Stderr, "Invalid go.mod:       % 9d\n", invalidGoMod)
+	fmt.Fprintf(os.Stderr, "Vendor paths:         % 9d\n", vendor.Load())
+	fmt.Fprintf(os.Stderr, "Spam:                 % 9d\n", spam.Load())
+	fmt.Fprintf(os.Stderr, "Invalid names:        % 9d\n", invalidName.Load())
+	fmt.Fprintf(os.Stderr, "Gone:                 % 9d\n", gone.Load())
+	fmt.Fprintf(os.Stderr, "Nil:                  % 9d\n", nilModOrModule.Load())
+	fmt.Fprintf(os.Stderr, "Unknown:              % 9d\n", unknown.Load())
+	fmt.Fprintf(os.Stderr, "Invalid go.mod:       % 9d\n", invalidGoMod.Load())
 	if !*all {
-		fmt.Fprintf(os.Stderr, "Mismatching go.mod:   % 9d\n", mismatchedGoMod)
-		fmt.Fprintf(os.Stderr, "No go.mod file:       % 9d\n", noGoMod)
+		fmt.Fprintf(os.Stderr, "Mismatching go.mod:   % 9d\n", mismatchedGoMod.Load())
+		fmt.Fprintf(os.Stderr, "No go.mod file:       % 9d\n", noGoMod.Load())
 	}
-	nonGoGiB := float64(nonGoSize) / float64(1<<30)
-	fmt.Fprintf(os.Stderr, "No .go files:         % 9d (%.1f GiB)\n", noGoCode, nonGoGiB)
+	nonGoGiB := float64(nonGoSize.Load()) / float64(1<<30)
+	fmt.Fprintf(os.Stderr, "No .go files:         % 9d (%.1f GiB)\n", noGoCode.Load(), nonGoGiB)
 	fmt.Fprintf(os.Stderr, "                      -------\n")
-	fmt.Fprintf(os.Stderr, "Valid:                % 9d\n", good)
+	fmt.Fprintf(os.Stderr, "Valid:                % 9d\n", good.Load())
 
 	// Extract and sort the per-extension size.
 	var extSize [][2]any
@@ -469,10 +453,10 @@ func main() {
 
 	fmt.Fprintf(os.Stderr, "\n")
 	fmt.Fprintf(os.Stderr, "Used index that as updated at %s.\n", indexCache.UpdatedAt.Format("2006-01-02 15:04:05 MST"))
-	fmt.Fprintf(os.Stderr, "Downloaded %d bytes (%d from GCS).\n", allBytes, gcsBytes)
-	fmt.Fprintf(os.Stderr, "Wrote %d Go-related files (%d bytes).\n", goFiles, goBytes)
-	fmt.Fprintf(os.Stderr, "Wrote %d .go source files (%d bytes).\n", onlyGoSrcFiles, onlyGoSrcFilesSize)
-	totalGiB := (float64(allBytes) / float64(1<<30))
+	fmt.Fprintf(os.Stderr, "Downloaded %d bytes (%d from GCS).\n", allBytes.Load(), gcsBytes.Load())
+	fmt.Fprintf(os.Stderr, "Wrote %d Go-related files (%d bytes).\n", goFiles.Load(), goBytes.Load())
+	fmt.Fprintf(os.Stderr, "Wrote %d .go source files (%d bytes).\n", onlyGoSrcFiles.Load(), onlyGoSrcFilesSize.Load())
+	totalGiB := (float64(allBytes.Load()) / float64(1<<30))
 	fmt.Fprintf(os.Stderr, "Module Proxy is saturated with %.2f%% Go-less modules.\n",
 		(nonGoGiB/totalGiB)*100)
 
