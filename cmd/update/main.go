@@ -76,6 +76,11 @@ var (
 	onlyGoSrcFilesSize uint64
 )
 
+// localGoModCache is the top-level
+// directory where all the downloaded
+// source code lives.
+var localGoModCache = filepath.Join(os.Getenv("HOME"), "go-ecosystem", "snapshots", "HEAD")
+
 func main() {
 	gob.Register(map[string]string{})
 	gob.Register(time.Time{})
@@ -105,20 +110,18 @@ func main() {
 
 	var bar *pb.ProgressBar
 
+	log.Println("local gomodcache: ", localGoModCache)
+
 	// If data/HEAD.index exists, it
 	// will be read, backed up, updated,
 	// and re-cached as HEAD.index.
-	indexCache := fetchIndex(ctx, bar)
+	indexCache := buildIndex(ctx, bar)
 
 	// Instead of downloading all modules,
 	// recursively walk the existing on-
 	// disk modules and build a mod->vers
 	// cache of what's present already.
-	topLevelDir, err := os.Readlink(filepath.Join(os.Getenv("HOME"), "go-ecosystem", "ALLCODE"))
-	if err != nil {
-		log.Fatal(err)
-	}
-	cache := buildLocalModVersCache(ctx, bar, topLevelDir)
+	modVersCache := alreadyDownloaded(ctx, bar, localGoModCache)
 
 	// TODO(nealpatel): Consider how an
 	// auxillary tool can be used to
@@ -167,7 +170,9 @@ func main() {
 			break
 		}
 
-		if cache[path] == version {
+		// TODO: Use the official semvar
+		// equals function?
+		if modVersCache[path] == version {
 			alreadyExists++
 			bar.Increment()
 			continue
@@ -484,10 +489,10 @@ func main() {
 	}
 }
 
-// fetchIndex will backup and update
+// buildIndex will backup and update
 // an existing index or create a new
 // index from scratch.
-func fetchIndex(ctx context.Context, bar *pb.ProgressBar) (indexCache IndexCache) {
+func buildIndex(ctx context.Context, bar *pb.ProgressBar) (indexCache IndexCache) {
 	// If data directory does not exist,
 	// create it for caching.
 	_, err := os.Stat("data")
@@ -601,11 +606,11 @@ func updateIndex(ctx context.Context, bar *pb.ProgressBar, cache *IndexCache) {
 	bar.Finish()
 }
 
-// buildLocalModVersCache provides a
+// alreadyDownloaded provides a
 // mapping of mod -> vers in order to
 // perform incremental updates to locally
 // cached source code.
-func buildLocalModVersCache(ctx context.Context, bar *pb.ProgressBar, root string) (cache map[string]string) {
+func alreadyDownloaded(ctx context.Context, bar *pb.ProgressBar, root string) (cache map[string]string) {
 	var mu sync.Mutex
 	cache = make(map[string]string, 1<<21) // nearly 2M entries cached
 	roots := make(map[string]bool, 1<<12)  // ~4000 top-level roots (e.g. github.com)
