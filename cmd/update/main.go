@@ -69,6 +69,10 @@ var (
 	// it's not a true representation.
 	onlyGoSrcFiles     atomic.Int64
 	onlyGoSrcFilesSize atomic.Uint64
+
+	// Metadata for the Go modules
+	// containing no .go files.
+	sizePerExt sync.Map
 )
 
 // localGoModCache is the top-level
@@ -79,7 +83,7 @@ var localGoModCache = filepath.Join(os.Getenv("HOME"), "go-ecosystem", "snapshot
 func main() {
 	gob.Register(map[string]string{})
 	gob.Register(time.Time{})
-	gob.Register(IndexCache{})
+	gob.Register(Index{})
 
 	cpuprofile := flag.String("cpuprofile", "", "write cpu profile to `FILE`")
 	memprofile := flag.String("memprofile", "", "write memory profile to `FILE`")
@@ -103,19 +107,40 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
-	var bar *pb.ProgressBar
-
 	log.Println("Using local go module cache: ", localGoModCache)
 
-	// If data/HEAD.index exists, it
-	// will be read, backed up, updated,
-	// and re-cached as HEAD.index.
-	indexCache := buildIndex(ctx, bar)
+	// If data directory does not exist,
+	// create it for caching.
+	_, err := os.Stat("data")
+	switch err {
+	case nil:
+	case os.ErrNotExist:
+		if err := os.Mkdir("data", 0755); err != nil {
+			log.Fatalf("cannot mkdir: %v", err)
+		}
+	default:
+		log.Fatal(err)
+	}
 
-	// Instead of downloading all modules,
-	// recursively walk the existing on-
-	// disk modules and build a mod->vers
-	// cache of what's present already.
+	var bar *pb.ProgressBar
+
+	// Fetch the index from disk, or
+	// create a new index from scratch.
+	index := NewIndex(ctx)
+
+	// Incrementally update the index in-place.
+	if err = index.Update(ctx, bar); err != nil {
+		log.Fatalf("failed to update index: %v", err)
+	}
+
+	// Save the updated index for re-use.
+	if err = index.Save(); err != nil {
+		log.Fatalf("failed to save index: %v", err)
+	}
+
+	// Instead of naively downloading all
+	// the code again, walk the local cache
+	// for all the (mod, vers) tuples.
 	modVersCache := alreadyDownloaded(ctx, bar, localGoModCache)
 
 	// TODO(nealpatel): Consider how an
@@ -125,10 +150,13 @@ func main() {
 	// updated.
 	_ = 0
 
+	// TODO(nealpatel) Remove outMu since the
+	// filesystem will synchronize for us.
+	outMu := &sync.Mutex{}
+
 	// TODO(nealpatel): Need to incrementally
 	// store these new versions at the HEAD
 	// of the module cache instead of tar.gz.
-	outMu := &sync.Mutex{}
 	var out io.WriteCloser = os.Stdout
 	if *compress {
 		out = gzip.NewWriter(out)
@@ -146,16 +174,14 @@ func main() {
 	dlog := log.New(lf, "", os.O_RDWR)
 	dlog.SetFlags(0)
 
-	// Metadata for the files.
-	var sizePerExt sync.Map
-	bar = pbTemplate.Start(len(indexCache.Latest)).Set("prefix", "Fetching modules...")
+	bar = pbTemplate.Start(len(index.Latest)).Set("prefix", "Fetching modules...")
 
 	var wg sync.WaitGroup
 	upstreamSem := make(chan struct{}, 250)
 	gcpSem := make(chan struct{}, 1500)
 
 	var alreadyExists int64
-	for path, version := range indexCache.Latest {
+	for path, version := range index.Latest {
 		if err := ctx.Err(); err != nil {
 			bar.Finish()
 			log.Println(path, version, err)
@@ -270,16 +296,11 @@ func main() {
 			// Walk through the files in the zip.
 			for _, f := range z.File {
 				_, localName, _ := strings.Cut(f.Name, modVers)
-
-				// sort by size later
+				// Quick and dirty hack for sorting later.
 				ls = append(ls, [2]any{"." + localName, f.UncompressedSize64})
-
-				// since we only consider this size
-				// when hasGoFiles is false, it is
-				// equivalent to conditionally adding
-				// up the sizes of non-Go files.
 				totalSize += f.UncompressedSize64
 
+				// Record anything that looks like an extension.
 				idx := strings.LastIndex(localName, ".")
 				if idx >= 0 && idx+1 < len(localName) {
 					exts[localName[idx+1:]] += f.UncompressedSize64
@@ -351,12 +372,17 @@ func main() {
 
 			good.Add(1)
 
-			// TODO(nealpatel) perform incremental
-			// updates over the local cache.
+			// TODO(nealpatel) At this point, we know
+			// that we do not have this particular
+			// mod@vers saved. Instead of writing into
+			// an archive, update the localGoModCache
+			// in-place with this new version.
 			for _, f := range z.File {
 				_ = f
 			}
 
+			// TODO(nealpatel) Remove outMu since the
+			// filesystem will synchronize for us.
 			outMu.Lock()
 			defer outMu.Unlock()
 			for _, f := range z.File {
@@ -404,8 +430,11 @@ func main() {
 
 	bar.Finish()
 
+	// ========================================== //
+	// *****        Dump statistics.        ***** //
+	// ========================================== //
 	fmt.Fprintf(os.Stderr, "\n")
-	fmt.Fprintf(os.Stderr, "Unique modules:       % 9d\n", len(indexCache.Latest))
+	fmt.Fprintf(os.Stderr, "Unique modules:       % 9d\n", len(index.Latest))
 	fmt.Fprintf(os.Stderr, "Already cached:       % 9d\n", alreadyExists)
 	fmt.Fprintf(os.Stderr, "Vendor paths:         % 9d\n", vendor.Load())
 	fmt.Fprintf(os.Stderr, "Spam:                 % 9d\n", spam.Load())
@@ -420,7 +449,7 @@ func main() {
 	}
 	nonGoGiB := float64(nonGoSize.Load()) / float64(1<<30)
 	fmt.Fprintf(os.Stderr, "No .go files:         % 9d (%.1f GiB)\n", noGoCode.Load(), nonGoGiB)
-	fmt.Fprintf(os.Stderr, "                      -------\n")
+	fmt.Fprintf(os.Stderr, "                      ---------\n")
 	fmt.Fprintf(os.Stderr, "Valid:                % 9d\n", good.Load())
 
 	// Extract and sort the per-extension size.
@@ -436,12 +465,21 @@ func main() {
 	})
 
 	// Preview to stderr.
-	const N = 20
+	N := min(20, len(extSize))
 	fmt.Fprintf(os.Stderr, "Top-%d Size by Extension (across all Go-less modules):\n", N)
 	for _, any2 := range extSize[:N] {
 		fmt.Fprintf(os.Stderr, "    %-30s %5.1f GiB\n",
 			any2[0].(string), float64(any2[1].(uint64))/float64(1<<30))
 	}
+
+	fmt.Fprintf(os.Stderr, "\n")
+	fmt.Fprintf(os.Stderr, "Used index that as updated at %s.\n", index.UpdatedAt.Format("2006-01-02 15:04:05 MST"))
+	fmt.Fprintf(os.Stderr, "Downloaded %d bytes (%d from GCS).\n", allBytes.Load(), gcsBytes.Load())
+	fmt.Fprintf(os.Stderr, "Wrote %d Go-related files (%d bytes).\n", goFiles.Load(), goBytes.Load())
+	fmt.Fprintf(os.Stderr, "Wrote %d .go source files (%d bytes).\n", onlyGoSrcFiles.Load(), onlyGoSrcFilesSize.Load())
+	totalGiB := (float64(allBytes.Load()) / float64(1<<30))
+	fmt.Fprintf(os.Stderr, "Module Proxy is saturated with %.2f%% Go-less modules.\n",
+		(nonGoGiB/totalGiB)*100)
 
 	// Dump the full statistics to logfile.
 	metadata := make([]string, len(extSize))
@@ -450,15 +488,6 @@ func main() {
 			any2[0].(string), float64(any2[1].(uint64))/float64(1<<30))
 	}
 	dlog.Printf("File Ext by Size (n=%d):\n\t%s\n", len(metadata), strings.Join(metadata, "\n\t"))
-
-	fmt.Fprintf(os.Stderr, "\n")
-	fmt.Fprintf(os.Stderr, "Used index that as updated at %s.\n", indexCache.UpdatedAt.Format("2006-01-02 15:04:05 MST"))
-	fmt.Fprintf(os.Stderr, "Downloaded %d bytes (%d from GCS).\n", allBytes.Load(), gcsBytes.Load())
-	fmt.Fprintf(os.Stderr, "Wrote %d Go-related files (%d bytes).\n", goFiles.Load(), goBytes.Load())
-	fmt.Fprintf(os.Stderr, "Wrote %d .go source files (%d bytes).\n", onlyGoSrcFiles.Load(), onlyGoSrcFilesSize.Load())
-	totalGiB := (float64(allBytes.Load()) / float64(1<<30))
-	fmt.Fprintf(os.Stderr, "Module Proxy is saturated with %.2f%% Go-less modules.\n",
-		(nonGoGiB/totalGiB)*100)
 
 	if *memprofile != "" {
 		f, err := os.Create(*memprofile)
@@ -471,123 +500,6 @@ func main() {
 			log.Fatal("could not write memory profile: ", err)
 		}
 	}
-}
-
-// buildIndex will backup and update
-// an existing index or create a new
-// index from scratch.
-func buildIndex(ctx context.Context, bar *pb.ProgressBar) (indexCache IndexCache) {
-	// If data directory does not exist,
-	// create it for caching.
-	_, err := os.Stat("data")
-	switch err {
-	case nil:
-	case os.ErrNotExist:
-		if err := os.Mkdir("data", 0755); err != nil {
-			log.Fatalf("cannot mkdir: %v", err)
-		}
-	default:
-		log.Fatalf("cannot stat: %v", err)
-	}
-
-	// Backup the current HEAD if it
-	// already exists.
-	const head = "data/HEAD.index"
-	_, err = os.Stat(head)
-	switch err {
-	case nil:
-		// Read the current HEAD.
-		file, err := os.ReadFile(head)
-		if err != nil {
-			log.Fatalf("cannot read %q: %v", head, err)
-		}
-		buf := bytes.NewBuffer(file)
-		gob.NewDecoder(buf).Decode(&indexCache)
-
-		// Backup the previous HEAD.
-		f, err := os.Create(fmt.Sprintf("data/HEAD.%s.index", indexCache.UpdatedAt.Format("20060102_150405")))
-		if err != nil {
-			log.Fatal(err)
-		}
-		defer f.Close()
-		if err = gob.NewEncoder(f).Encode(indexCache); err != nil {
-			log.Panicf("could backup %s: %v", head, err)
-		}
-		if err = os.Remove(head); err != nil {
-			log.Fatalf("cannot remove %s: %v", head, err)
-		}
-
-	case os.ErrNotExist:
-		log.Printf("no ./data/HEAD.index found; building new HEAD from scratch (this may take a while)")
-		indexCache = IndexCache{Latest: make(map[string]string)}
-
-	default:
-		log.Fatalf("cannot stat data/HEAD.index: %v", err)
-	}
-
-	updateIndex(ctx, bar, &indexCache)
-
-	// Cache the updated index as HEAD.index
-	f, err := os.Create(head)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer f.Close()
-	if err = gob.NewEncoder(f).Encode(indexCache); err != nil {
-		log.Panicf("could not encode index: %v", err)
-	}
-
-	return
-}
-
-func updateIndex(ctx context.Context, bar *pb.ProgressBar, cache *IndexCache) {
-	latest, err := fetchLatest(ctx)
-	if err != nil {
-		log.Fatal(err)
-	}
-	tree, err := tlog.ParseTree(latest)
-	if err != nil {
-		log.Fatal(err)
-	}
-	N := tree.N - int64(cache.TotalVersions)
-
-	if N <= 0 {
-		const cacheFmt = "\tLatest: %d\n\tTotal Versions: %d\n\tUpdatedAt: %s"
-		log.Printf("no updates for index\n{\n%s\n}",
-			fmt.Sprintf(cacheFmt,
-				len(cache.Latest),
-				cache.TotalVersions,
-				cache.UpdatedAt.Format("2006-01-02 15:04:05 UTC")),
-		)
-		return
-	}
-	bar = pbTemplate.Start64(N).Set("prefix", "Updating index...")
-
-	// Create a new Index walker using
-	// the previously cached timestamp.
-	start := time.Now()
-	i := NewIndex(ctx, cache.UpdatedAt)
-	cache.UpdatedAt = start
-	cache.TotalVersions = uint64(tree.N)
-
-	var linesSeen uint64
-	for {
-		v, err := i.next(ctx)
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			log.Fatal(err)
-		}
-		linesSeen++
-		bar.Increment()
-
-		if semver.Compare(v.Version, cache.Latest[v.Path]) >= 0 {
-			cache.Latest[v.Path] = v.Version
-		}
-	}
-
-	bar.Finish()
 }
 
 // alreadyDownloaded provides a
@@ -690,29 +602,129 @@ func alreadyDownloaded(ctx context.Context, bar *pb.ProgressBar, root string) (c
 	if err != nil {
 		log.Fatalf("couldn't build cache of latest: %v", err)
 	}
-	log.Println("cached %d latest versions")
+	log.Printf("cached %d latest versions", len(cache))
 	return
 }
 
-// TODO(nealpatel): Roll functionality into
-// this instead of free functions?
-type IndexCache struct {
-	Latest        map[string]string
-	UpdatedAt     time.Time
-	TotalVersions uint64
-}
+func NewIndex(ctx context.Context) *Index {
+	var i Index
+	i.outFile = "data/HEAD.index"
 
-func NewIndex(ctx context.Context, lastUpdate time.Time) *Index {
-	i := &Index{last: lastUpdate}
-	if err := i.nextPage(ctx); err != nil {
-		panic(err)
+	// Backup the current HEAD if it already exists.
+	_, err := os.Stat(i.outFile)
+	switch err {
+	case nil:
+		// Read the current HEAD.
+		file, err := os.ReadFile(i.outFile)
+		if err != nil {
+			log.Fatalf("cannot read %q: %v", i.outFile, err)
+		}
+		gob.NewDecoder(bytes.NewBuffer(file)).Decode(&i)
+
+		// Backup the previous HEAD.
+		f, err := os.Create(fmt.Sprintf("data/HEAD.%s.index", i.UpdatedAt.Format("20060102_150405")))
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer f.Close()
+		if err = gob.NewEncoder(f).Encode(i); err != nil {
+			log.Panicf("could backup %s: %v", i.outFile, err)
+		}
+
+	case os.ErrNotExist:
+		log.Printf("no %q found; building new HEAD from scratch (this may take a while)", i.outFile)
+		i = Index{Latest: make(map[string]string)}
+
+	default:
+		log.Fatalf("cannot stat %q: %v", i.outFile, err)
 	}
-	return i
+
+	// Set last such that duplicates since
+	// last pull may occur; however, we will
+	// not miss any new entries.
+	i.last = i.UpdatedAt
+	i.UpdatedAt = time.Now()
+
+	// Pre-seed [Index] with the next page to
+	// incrementally update the cache.
+	if err := i.nextPage(ctx); err != nil {
+		log.Fatalf("cannot get first page: %v", err)
+	}
+
+	return &i
 }
 
 type Index struct {
+	Latest        map[string]string
+	UpdatedAt     time.Time
+	TotalVersions uint64
+
+	outFile string
+
 	last time.Time
 	d    *json.Decoder
+}
+
+func (i *Index) Update(ctx context.Context, bar *pb.ProgressBar) error {
+	latest, err := fetchLatest(ctx)
+	if err != nil {
+		return err
+	}
+	tree, err := tlog.ParseTree(latest)
+	if err != nil {
+		return err
+	}
+	N := tree.N - int64(i.TotalVersions)
+
+	if N <= 0 {
+		const cacheFmt = "\tLatest: %d\n\tTotal Versions: %d\n\tUpdatedAt: %s"
+		log.Printf("no updates for index\n{\n%s\n}",
+			fmt.Sprintf(cacheFmt,
+				len(i.Latest),
+				i.TotalVersions,
+				i.UpdatedAt.Format("2006-01-02 15:04:05 UTC")),
+		)
+		return nil
+	}
+
+	bar = pbTemplate.Start64(N).Set("prefix", "Updating index...")
+	defer bar.Finish()
+
+	i.TotalVersions = uint64(tree.N)
+
+	var linesSeen uint64
+	for {
+		v, err := i.next(ctx)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			log.Fatal(err)
+		}
+		linesSeen++
+		bar.Increment()
+
+		if semver.Compare(v.Version, i.Latest[v.Path]) >= 0 {
+			i.Latest[v.Path] = v.Version
+		}
+	}
+
+	return nil
+}
+
+func (i *Index) Save() error {
+	if err := os.Remove(i.outFile); err != nil {
+		log.Printf("warn: cannot remove %q: %v", i.outFile, err)
+	}
+	f, err := os.Create(i.outFile)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if err = gob.NewEncoder(f).Encode(*i); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (i *Index) next(ctx context.Context) (*Version, error) {
