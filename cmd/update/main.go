@@ -23,7 +23,6 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
-	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -141,9 +140,10 @@ func main() {
 	// Instead of naively downloading all
 	// the code again, walk the local cache
 	// for all the (mod, vers) tuples.
-	bar = pbTemplate.Start(approxOnDiskModules).Set("prefix", "Building cache...")
-	modVersCache := alreadyDownloaded(ctx, localGoModCache)
-	bar.Finish()
+	modVersCache, err := alreadyDownloaded(ctx, bar, localGoModCache)
+	if err != nil {
+		log.Fatalf("failed to walk local disk for already downloaded modules: %v", err)
+	}
 
 	// TODO(nealpatel): Consider how an
 	// auxillary tool can be used to
@@ -404,11 +404,16 @@ func main() {
 // mapping of mod -> vers in order to
 // perform incremental updates to locally
 // cached source code.
-func alreadyDownloaded(ctx context.Context, root string) (cache map[string]string) {
-	var depth, roots sync.Map
+func alreadyDownloaded(ctx context.Context, bar *pb.ProgressBar, root string) (map[string]string, error) {
+	bar = pbTemplate.Start(approxOnDiskModules).Set("prefix", "Building cache...")
+	defer bar.Finish()
 
-	var mu sync.Mutex
-	cache = make(map[string]string, approxOnDiskModules)
+	var (
+		roots sync.Map
+
+		mu    sync.Mutex
+		cache = make(map[string]string, approxOnDiskModules)
+	)
 
 	// Agnostic to whether or not a go.mod exists.
 	modVersResolver := func(path string, d fs.DirEntry, err error) error {
@@ -437,8 +442,6 @@ func alreadyDownloaded(ctx context.Context, root string) (cache map[string]strin
 		mu.Lock()
 		cache[mod[1:]] = vers // mod contains a leading slash
 		mu.Unlock()
-		c, _ := depth.LoadOrStore(strings.Count(modVers, "/"), &atomic.Int64{})
-		c.(*atomic.Int64).Add(1)
 		bar.Increment()
 
 		// since d is a directory,
@@ -452,7 +455,7 @@ func alreadyDownloaded(ctx context.Context, root string) (cache map[string]strin
 
 	dirs, err := os.ReadDir(root)
 	if err != nil {
-		log.Fatalf("cannot read top level dirs: %v", err)
+		return nil, err
 	}
 	log.Printf("walking %d top-level directories ...", len(dirs))
 
@@ -470,7 +473,7 @@ func alreadyDownloaded(ctx context.Context, root string) (cache map[string]strin
 
 		// Spawn a goroutine for each top-level
 		// directory to shard the walking.
-		err := filepath.WalkDir(path, func(path string, d fs.DirEntry, werr error) error {
+		err = filepath.WalkDir(path, func(path string, d fs.DirEntry, werr error) error {
 			if werr != nil {
 				return werr
 			}
@@ -492,32 +495,11 @@ func alreadyDownloaded(ctx context.Context, root string) (cache map[string]strin
 			return filepath.SkipDir
 		})
 		if err != nil {
-			log.Printf("%s: %v", path, err)
+			return nil, err
 		}
 	}
-
 	wg.Wait()
-
-	// For fun.
-	var modAtDepth [][2]int
-	depth.Range(func(key, value any) bool {
-
-		modAtDepth = append(modAtDepth, [2]int{key.(int), int(value.(*atomic.Int64).Load())})
-		return true
-	})
-	sort.Slice(modAtDepth, func(i, j int) bool {
-		return modAtDepth[i][0] < modAtDepth[j][0]
-	})
-	log.Printf("canonical version path length histogram:")
-	for _, int2 := range modAtDepth {
-		log.Printf("%2d -> %8d", int2[0], int2[1])
-	}
-
-	if err != nil {
-		log.Fatalf("couldn't build cache of latest: %v", err)
-	}
-	log.Printf("cached %d latest versions", len(cache))
-	return
+	return cache, nil
 }
 
 func NewIndex(ctx context.Context) *Index {
