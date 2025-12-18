@@ -18,11 +18,11 @@ import (
 	"io/fs"
 	"log"
 	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"runtime"
-	"runtime/pprof"
 	"sort"
 	"strings"
 	"sync"
@@ -80,27 +80,26 @@ var (
 // source code lives.
 var localGoModCache = filepath.Join(os.Getenv("HOME"), "go-ecosystem", "snapshots", "HEAD")
 
+// set approxOnDiskModules to approximate
+// number of modules on disk for nicer tui.
+const approxOnDiskModules = 1_870_670 // 1_332_264
+
 func main() {
 	gob.Register(map[string]string{})
 	gob.Register(time.Time{})
 	gob.Register(Index{})
 
-	cpuprofile := flag.String("cpuprofile", "", "write cpu profile to `FILE`")
-	memprofile := flag.String("memprofile", "", "write memory profile to `FILE`")
+	profile := flag.Bool("pprof", false, "enable profiling endpoint.")
 	compress := flag.Bool("z", false, "compress the output tar archive with gzip")
 	all := flag.Bool("all", false, "include potential forks (mismatching and missing go.mod)")
 	flag.Parse()
 
-	if *cpuprofile != "" {
-		f, err := os.Create(*cpuprofile)
-		if err != nil {
-			log.Fatal("could not create CPU profile: ", err)
-		}
-		defer f.Close()
-		if err := pprof.StartCPUProfile(f); err != nil {
-			log.Fatal("could not start CPU profile: ", err)
-		}
-		defer pprof.StopCPUProfile()
+	if *profile {
+		go func() {
+			// production grade = 10000
+			runtime.SetBlockProfileRate(1)
+			http.ListenAndServe("localhost:6060", nil)
+		}()
 	}
 
 	log.SetFlags(log.Lshortfile | log.Flags())
@@ -142,6 +141,8 @@ func main() {
 	// the code again, walk the local cache
 	// for all the (mod, vers) tuples.
 	modVersCache := alreadyDownloaded(ctx, bar, localGoModCache)
+
+	return
 
 	// TODO(nealpatel): Consider how an
 	// auxillary tool can be used to
@@ -377,9 +378,9 @@ func main() {
 			// mod@vers saved. Instead of writing into
 			// an archive, update the localGoModCache
 			// in-place with this new version.
-			for _, f := range z.File {
-				_ = f
-			}
+			// for _, f := range z.File {
+			// 	_ = f
+			// }
 
 			// TODO(nealpatel) Remove outMu since the
 			// filesystem will synchronize for us.
@@ -488,18 +489,6 @@ func main() {
 			any2[0].(string), float64(any2[1].(uint64))/float64(1<<30))
 	}
 	dlog.Printf("File Ext by Size (n=%d):\n\t%s\n", len(metadata), strings.Join(metadata, "\n\t"))
-
-	if *memprofile != "" {
-		f, err := os.Create(*memprofile)
-		if err != nil {
-			log.Fatal("could not create memory profile: ", err)
-		}
-		defer f.Close()
-		runtime.GC() // get up-to-date statistics
-		if err := pprof.WriteHeapProfile(f); err != nil {
-			log.Fatal("could not write memory profile: ", err)
-		}
-	}
 }
 
 // alreadyDownloaded provides a
@@ -507,97 +496,114 @@ func main() {
 // perform incremental updates to locally
 // cached source code.
 func alreadyDownloaded(ctx context.Context, bar *pb.ProgressBar, root string) (cache map[string]string) {
+	var depth, roots sync.Map
+
 	var mu sync.Mutex
 	cache = make(map[string]string, 1<<21) // nearly 2M entries cached
-	roots := make(map[string]bool, 1<<12)  // ~4000 top-level roots (e.g. github.com)
 
-	cacheLatest := func(root string) error {
-		modBytes, err := os.ReadFile(filepath.Join(root, "go.mod"))
-		if err != nil {
-			return err
-		}
-		if _, err = modfile.ParseLax(root, modBytes, nil); err != nil {
-			return err
-		}
-		const prefix = "/usr/local/google/home/nealpatel/go-ecosystem/snapshots/20250807/"
-		_, modVers, _ := strings.Cut(root, prefix)
-		mod, vers, _ := strings.Cut(modVers, "@")
-		mu.Lock()
-		cache[mod] = vers
-		mu.Unlock()
-		return nil
-	}
-
+	// Agnostic to whether or not a go.mod exists.
 	modVersResolver := func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
-		if err := ctx.Err(); err != nil {
-			return err
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
 		}
-		if strings.Contains(d.Name(), "@") {
-			err := cacheLatest(path)
-			if err == nil {
-				bar.Increment()
-				return filepath.SkipDir
-			}
-			return nil // try again deeper
-		}
-		return nil
-	}
-
-	// an estimate just for nice tui.
-	bar = pbTemplate.Start(1_870_670).Set("prefix", "Building cache...")
-
-	var wg sync.WaitGroup
-	wsem := make(chan struct{}, 512)
-
-	shardedDirWalker := func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		mu.Lock()
-		pass := roots[path]
-		mu.Unlock()
-		if pass {
+		if _, found := roots.Load(path); found {
 			return nil
 		}
 
-		wsem <- struct{}{}
-		wg.Go(func() {
-			defer func() { <-wsem }()
-			filepath.WalkDir(path, modVersResolver) // ignores error
-		})
+		_, modVers, found := strings.Cut(path, localGoModCache)
+		if !found {
+			log.Printf("unexpected: local cache prefix was not found?")
+			return nil
+		}
+		mod, vers, found := strings.Cut(modVers, "@")
+		if !found {
+			return nil
+		}
 
-		// for example, inside of github.com,
-		// once spawning for a given username,
-		// skip the rest of its contents.
-		return filepath.SkipDir // this might have small edge cases
+		mu.Lock()
+		cache[mod] = vers
+		mu.Unlock()
+		c, _ := depth.LoadOrStore(strings.Count(modVers, "/"), &atomic.Int64{})
+		c.(*atomic.Int64).Add(1)
+		bar.Increment()
+
+		// since d is a directory,
+		// this will skip looking
+		// into the mod@vers dir.
+		return filepath.SkipDir
 	}
+
+	var wg sync.WaitGroup
+	wsem := make(chan struct{}, 1<<11)
+	bar = pbTemplate.Start(approxOnDiskModules).Set("prefix", "Building cache...")
 
 	dirs, err := os.ReadDir(root)
 	if err != nil {
 		log.Fatalf("cannot read top level dirs: %v", err)
 	}
+	log.Printf("walking %d top-level directories ...", len(dirs))
 
+	/*
+		% la HEAD | awk '{print $5 " " $9}' | sort -h | tail -10
+		86016 gopkg.in
+		135168 gitee.com
+		163840 gitlab.com
+		192512 .
+		16674816 github.com
+	*/
 	for _, dir := range dirs {
 		path := filepath.Join(root, dir.Name())
-		mu.Lock()
-		roots[path] = true
-		mu.Unlock()
+		roots.Store(path, struct{}{})
 
-		wsem <- struct{}{}
-		wg.Go(func() {
-			defer func() { <-wsem }()
-			_ = filepath.WalkDir(path, shardedDirWalker)
+		// Spawn a goroutine for each top-level
+		// directory to shard the walking.
+		err := filepath.WalkDir(path, func(path string, d fs.DirEntry, werr error) error {
+			if werr != nil {
+				return werr
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+			}
+			if _, found := roots.Load(path); found {
+				return nil
+			}
+
+			roots.Store(path, struct{}{})
+			wsem <- struct{}{}
+			wg.Go(func() {
+				defer func() { <-wsem }()
+				_ = filepath.WalkDir(path, modVersResolver)
+			})
+			return filepath.SkipDir
 		})
+		if err != nil {
+			log.Printf("%s: %v", path, err)
+		}
 	}
 
 	wg.Wait()
 	bar.Finish()
+
+	// For fun.
+	var modAtDepth [][2]int
+	depth.Range(func(key, value any) bool {
+
+		modAtDepth = append(modAtDepth, [2]int{key.(int), int(value.(*atomic.Int64).Load())})
+		return true
+	})
+	sort.Slice(modAtDepth, func(i, j int) bool {
+		return modAtDepth[i][0] < modAtDepth[j][0]
+	})
+	for _, int2 := range modAtDepth {
+		log.Printf("%2d -> %8d", int2[0], int2[1])
+	}
 
 	if err != nil {
 		log.Fatalf("couldn't build cache of latest: %v", err)
