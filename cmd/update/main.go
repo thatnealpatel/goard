@@ -165,17 +165,6 @@ func main() {
 	}
 	tw := tar.NewWriter(out)
 
-	// logs.txt has a loose structure
-	// that documents large modules
-	// that contain no .go files.
-	lf, err := os.Create("data/mois.txt") // 'modules of interest'
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer lf.Close()
-	dlog := log.New(lf, "", os.O_RDWR)
-	dlog.SetFlags(0)
-
 	bar = pbTemplate.Start(len(index.Latest)).Set("prefix", "Fetching modules...")
 
 	var (
