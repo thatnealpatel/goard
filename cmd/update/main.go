@@ -141,7 +141,9 @@ func main() {
 	// Instead of naively downloading all
 	// the code again, walk the local cache
 	// for all the (mod, vers) tuples.
-	modVersCache := alreadyDownloaded(ctx, bar, localGoModCache)
+	bar = pbTemplate.Start(approxOnDiskModules).Set("prefix", "Building cache...")
+	modVersCache := alreadyDownloaded(ctx, localGoModCache)
+	bar.Finish()
 
 	// TODO(nealpatel): Consider how an
 	// auxillary tool can be used to
@@ -195,14 +197,11 @@ func main() {
 	upstreamSem := make(chan struct{}, 250)
 	gcpSem := make(chan struct{}, 1500)
 
-outer:
 	for path, version := range incrementalUpdates {
-		select {
-		case <-ctx.Done():
+		if err := ctx.Err(); err != nil { // slower than select+case, but ok
 			bar.Finish()
 			log.Println(path, version, err)
-			break outer
-		default:
+			break
 		}
 
 		upstreamSem <- struct{}{}
@@ -416,11 +415,11 @@ outer:
 // mapping of mod -> vers in order to
 // perform incremental updates to locally
 // cached source code.
-func alreadyDownloaded(ctx context.Context, bar *pb.ProgressBar, root string) (cache map[string]string) {
+func alreadyDownloaded(ctx context.Context, root string) (cache map[string]string) {
 	var depth, roots sync.Map
 
 	var mu sync.Mutex
-	cache = make(map[string]string, 1<<21) // nearly 2M entries cached
+	cache = make(map[string]string, approxOnDiskModules)
 
 	// Agnostic to whether or not a go.mod exists.
 	modVersResolver := func(path string, d fs.DirEntry, err error) error {
@@ -461,7 +460,6 @@ func alreadyDownloaded(ctx context.Context, bar *pb.ProgressBar, root string) (c
 
 	var wg sync.WaitGroup
 	wsem := make(chan struct{}, 1<<11)
-	bar = pbTemplate.Start(approxOnDiskModules).Set("prefix", "Building cache...")
 
 	dirs, err := os.ReadDir(root)
 	if err != nil {
@@ -510,7 +508,6 @@ func alreadyDownloaded(ctx context.Context, bar *pb.ProgressBar, root string) (c
 	}
 
 	wg.Wait()
-	bar.Finish()
 
 	// For fun.
 	var modAtDepth [][2]int
