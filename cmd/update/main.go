@@ -82,8 +82,10 @@ var localGoModCache = filepath.Join(os.Getenv("HOME"), "go-ecosystem", "snapshot
 
 // set approxOnDiskModules to approximate
 // number of modules on disk for nicer tui.
-const approxOnDiskModules = 1_870_670 // 1_332_264
+const approxOnDiskModules = 1_870_670
 
+// TODO(nealpatel): Refactor this to be
+// much easier to read.
 func main() {
 	gob.Register(map[string]string{})
 	gob.Register(time.Time{})
@@ -96,8 +98,7 @@ func main() {
 
 	if *profile {
 		go func() {
-			// production grade = 10000
-			runtime.SetBlockProfileRate(1)
+			runtime.SetBlockProfileRate(1) // production grade = 10000
 			http.ListenAndServe("localhost:6060", nil)
 		}()
 	}
@@ -106,7 +107,7 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
-	log.Println("Using local go module cache: ", localGoModCache)
+	log.Println("using: ", localGoModCache)
 
 	// If data directory does not exist,
 	// create it for caching.
@@ -142,8 +143,6 @@ func main() {
 	// for all the (mod, vers) tuples.
 	modVersCache := alreadyDownloaded(ctx, bar, localGoModCache)
 
-	return
-
 	// TODO(nealpatel): Consider how an
 	// auxillary tool can be used to
 	// prune non-latest versions from a
@@ -177,24 +176,33 @@ func main() {
 
 	bar = pbTemplate.Start(len(index.Latest)).Set("prefix", "Fetching modules...")
 
-	var wg sync.WaitGroup
-	upstreamSem := make(chan struct{}, 250)
-	gcpSem := make(chan struct{}, 1500)
-
-	var alreadyExists int64
+	var (
+		alreadyExists      int64
+		incrementalUpdates = make(map[string]string)
+	)
 	for path, version := range index.Latest {
-		if err := ctx.Err(); err != nil {
-			bar.Finish()
-			log.Println(path, version, err)
-			break
-		}
-
 		// TODO: Use the official semvar
 		// equals function?
 		if modVersCache[path] == version {
 			alreadyExists++
 			bar.Increment()
 			continue
+		}
+		incrementalUpdates[path] = version
+	}
+
+	var wg sync.WaitGroup
+	upstreamSem := make(chan struct{}, 250)
+	gcpSem := make(chan struct{}, 1500)
+
+outer:
+	for path, version := range incrementalUpdates {
+		select {
+		case <-ctx.Done():
+			bar.Finish()
+			log.Println(path, version, err)
+			break outer
+		default:
 		}
 
 		upstreamSem <- struct{}{}
@@ -289,24 +297,11 @@ func main() {
 
 			var hasGoMod, hasGoFiles bool
 			var extractedSize uint64
-			var totalSize uint64
-			ls := make([][2]any, 0, len(z.File))
-			exts := make(map[string]uint64)
-			modVers := path + "@" + version
+			var modSize uint64
 
 			// Walk through the files in the zip.
 			for _, f := range z.File {
-				_, localName, _ := strings.Cut(f.Name, modVers)
-				// Quick and dirty hack for sorting later.
-				ls = append(ls, [2]any{"." + localName, f.UncompressedSize64})
-				totalSize += f.UncompressedSize64
-
-				// Record anything that looks like an extension.
-				idx := strings.LastIndex(localName, ".")
-				if idx >= 0 && idx+1 < len(localName) {
-					exts[localName[idx+1:]] += f.UncompressedSize64
-				}
-
+				modSize += f.UncompressedSize64
 				if strings.HasSuffix(f.Name, ".go") {
 					onlyGoSrcFiles.Add(1)
 					onlyGoSrcFilesSize.Add(f.UncompressedSize64)
@@ -324,46 +319,7 @@ func main() {
 			// are very intersting.
 			if !hasGoFiles {
 				noGoCode.Add(1)
-				nonGoSize.Add(totalSize)
-				for ext, size := range exts {
-					v, _ := sizePerExt.LoadOrStore(ext, (&atomic.Uint64{}))
-					v.(*atomic.Uint64).Add(size)
-				}
-
-				// If the module itself isn't at
-				// least 537MiB, don't log more
-				// details about it.
-				if totalSize>>29 < 1 {
-					return
-				}
-
-				// Descending sort the files by size.
-				sort.Slice(ls, func(i, j int) bool {
-					return ls[i][1].(uint64) > ls[j][1].(uint64)
-				})
-
-				files := make([]string, len(ls))
-				for i, any2 := range ls {
-					mib := float64(any2[1].(uint64)) / float64(1<<20)
-					files[i] = fmt.Sprintf("[%4.0f MiB] %s", mib, any2[0].(string))
-				}
-
-				outMu.Lock()
-				defer outMu.Unlock()
-
-				dlog.Printf("module: %q", modVers)
-				dlog.Printf("num_files: %d", len(ls))
-				dlog.Printf("mod_size: %d B", size)
-				list := make([]string, 0, len(exts))
-				for ext := range exts {
-					list = append(list, fmt.Sprintf("%q", ext))
-				}
-				dlog.Printf("num_extensions: %d", len(list))
-				// This format allows for easy folding in vim.
-				dlog.Printf("extensions {\n\t%s\n}", strings.Join(list, "\n\t"))
-				dlog.Printf("files {\n\t%s\n}", strings.Join(files, "\n\t"))
-				dlog.Printf("\n\n")
-				return
+				nonGoSize.Add(modSize)
 			}
 
 			if !hasGoMod && !*all {
@@ -378,9 +334,6 @@ func main() {
 			// mod@vers saved. Instead of writing into
 			// an archive, update the localGoModCache
 			// in-place with this new version.
-			// for _, f := range z.File {
-			// 	_ = f
-			// }
 
 			// TODO(nealpatel) Remove outMu since the
 			// filesystem will synchronize for us.
@@ -431,9 +384,9 @@ func main() {
 
 	bar.Finish()
 
-	// ========================================== //
-	// *****        Dump statistics.        ***** //
-	// ========================================== //
+	// ==================================================================== //
+	// *****                     Dump statistics.                     ***** //
+	// ==================================================================== //
 	fmt.Fprintf(os.Stderr, "\n")
 	fmt.Fprintf(os.Stderr, "Unique modules:       % 9d\n", len(index.Latest))
 	fmt.Fprintf(os.Stderr, "Already cached:       % 9d\n", alreadyExists)
@@ -452,43 +405,11 @@ func main() {
 	fmt.Fprintf(os.Stderr, "No .go files:         % 9d (%.1f GiB)\n", noGoCode.Load(), nonGoGiB)
 	fmt.Fprintf(os.Stderr, "                      ---------\n")
 	fmt.Fprintf(os.Stderr, "Valid:                % 9d\n", good.Load())
-
-	// Extract and sort the per-extension size.
-	var extSize [][2]any
-	sizePerExt.Range(func(key, value any) bool {
-		ext, _ := key.(string)
-		c, _ := value.(*atomic.Uint64)
-		extSize = append(extSize, [2]any{ext, c.Load()})
-		return true
-	})
-	sort.Slice(extSize, func(i, j int) bool {
-		return extSize[i][1].(uint64) > extSize[j][1].(uint64)
-	})
-
-	// Preview to stderr.
-	N := min(20, len(extSize))
-	fmt.Fprintf(os.Stderr, "Top-%d Size by Extension (across all Go-less modules):\n", N)
-	for _, any2 := range extSize[:N] {
-		fmt.Fprintf(os.Stderr, "    %-30s %5.1f GiB\n",
-			any2[0].(string), float64(any2[1].(uint64))/float64(1<<30))
-	}
-
 	fmt.Fprintf(os.Stderr, "\n")
 	fmt.Fprintf(os.Stderr, "Used index that as updated at %s.\n", index.UpdatedAt.Format("2006-01-02 15:04:05 MST"))
 	fmt.Fprintf(os.Stderr, "Downloaded %d bytes (%d from GCS).\n", allBytes.Load(), gcsBytes.Load())
 	fmt.Fprintf(os.Stderr, "Wrote %d Go-related files (%d bytes).\n", goFiles.Load(), goBytes.Load())
 	fmt.Fprintf(os.Stderr, "Wrote %d .go source files (%d bytes).\n", onlyGoSrcFiles.Load(), onlyGoSrcFilesSize.Load())
-	totalGiB := (float64(allBytes.Load()) / float64(1<<30))
-	fmt.Fprintf(os.Stderr, "Module Proxy is saturated with %.2f%% Go-less modules.\n",
-		(nonGoGiB/totalGiB)*100)
-
-	// Dump the full statistics to logfile.
-	metadata := make([]string, len(extSize))
-	for i, any2 := range extSize {
-		metadata[i] = fmt.Sprintf("%-30s    %.3f GiB",
-			any2[0].(string), float64(any2[1].(uint64))/float64(1<<30))
-	}
-	dlog.Printf("File Ext by Size (n=%d):\n\t%s\n", len(metadata), strings.Join(metadata, "\n\t"))
 }
 
 // alreadyDownloaded provides a
@@ -526,7 +447,7 @@ func alreadyDownloaded(ctx context.Context, bar *pb.ProgressBar, root string) (c
 		}
 
 		mu.Lock()
-		cache[mod] = vers
+		cache[mod[1:]] = vers // mod contains a leading slash
 		mu.Unlock()
 		c, _ := depth.LoadOrStore(strings.Count(modVers, "/"), &atomic.Int64{})
 		c.(*atomic.Int64).Add(1)
@@ -601,6 +522,7 @@ func alreadyDownloaded(ctx context.Context, bar *pb.ProgressBar, root string) (c
 	sort.Slice(modAtDepth, func(i, j int) bool {
 		return modAtDepth[i][0] < modAtDepth[j][0]
 	})
+	log.Printf("canonical version path length histogram:")
 	for _, int2 := range modAtDepth {
 		log.Printf("%2d -> %8d", int2[0], int2[1])
 	}
