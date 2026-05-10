@@ -5,7 +5,6 @@
 package main
 
 import (
-	"archive/tar"
 	"archive/zip"
 	"bytes"
 	"context"
@@ -15,7 +14,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/fs"
 	"log"
 	"net/http"
 	_ "net/http/pprof"
@@ -23,158 +21,97 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/cheggaaa/pb/v3"
-	gzip "github.com/klauspost/pgzip"
 	"golang.org/x/mod/modfile"
 	"golang.org/x/mod/module"
 	"golang.org/x/mod/semver"
-	"golang.org/x/mod/sumdb/tlog"
 )
-
-var httpClient = &http.Client{
-	Timeout: 60 * time.Minute,
-	Transport: &http.Transport{
-		MaxIdleConnsPerHost: 1024,
-	},
-}
-
-var pbTemplate pb.ProgressBarTemplate = `{{string . "prefix"}} {{counters . }} {{bar . }} {{percent . }} {{etime . }}`
 
 var (
-	gone            atomic.Int64
-	unknown         atomic.Int64
-	nilModOrModule  atomic.Int64
-	invalidName     atomic.Int64
-	vendor          atomic.Int64
-	spam            atomic.Int64
-	mismatchedGoMod atomic.Int64
-	invalidGoMod    atomic.Int64
-	noGoCode        atomic.Int64
-	noGoMod         atomic.Int64
-	gcsBytes        atomic.Int64
-	good            atomic.Int64
-	goBytes         atomic.Int64
-	allBytes        atomic.Int64
-	goFiles         atomic.Int64
-	nonGoSize       atomic.Uint64
+	httpClient = &http.Client{
+		Timeout: 60 * time.Minute,
+		Transport: &http.Transport{
+			MaxConnsPerHost:     2048,
+			MaxIdleConns:        2048,
+			MaxIdleConnsPerHost: 2048,
+			ForceAttemptHTTP2:   true,
+		},
+	}
 
-	// Since goBytes and goFiles count
-	// all the extensions in ignoreFile
-	// it's not a true representation.
-	onlyGoSrcFiles     atomic.Int64
-	onlyGoSrcFilesSize atomic.Uint64
-
-	// Metadata for the Go modules
-	// containing no .go files.
-	sizePerExt sync.Map
+	dst       string
+	tmp       string
+	indexFile string
 )
 
-// localGoModCache is the top-level
-// directory where all the downloaded
-// source code lives.
-var localGoModCache = filepath.Join(os.Getenv("HOME"), "go-ecosystem", "snapshots", "HEAD")
-
-// set approxOnDiskModules to approximate
-// number of modules on disk for nicer tui.
-const approxOnDiskModules = 1_870_670
-
-// TODO(nealpatel): Refactor this to be
-// much easier to read.
 func main() {
+	var (
+		profile   = flag.Bool("pprof", false, "enable profiling endpoint.")
+		all       = flag.Bool("all", false, "include potential forks (mismatching and missing go.mod)")
+		indexOnly = flag.Bool("index", false, "update index only")
+	)
+	flag.Parse()
+
+	log.SetFlags(log.Lshortfile | log.Flags())
+
 	gob.Register(map[string]string{})
 	gob.Register(time.Time{})
 	gob.Register(Index{})
 
-	profile := flag.Bool("pprof", false, "enable profiling endpoint.")
-	compress := flag.Bool("z", false, "compress the output tar archive with gzip")
-	all := flag.Bool("all", false, "include potential forks (mismatching and missing go.mod)")
-	flag.Parse()
-
-	if *profile {
-		go func() {
-			runtime.SetBlockProfileRate(1) // production grade = 10000
-			http.ListenAndServe("localhost:6060", nil)
-		}()
+	home, err := os.UserHomeDir()
+	if err != nil {
+		log.Fatal(err)
 	}
-
-	log.SetFlags(log.Lshortfile | log.Flags())
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
-	defer cancel()
-
-	log.Println("using: ", localGoModCache)
-
-	// If data directory does not exist,
-	// create it for caching.
-	_, err := os.Stat("data")
-	switch err {
-	case nil:
-	case os.ErrNotExist:
-		if err := os.Mkdir("data", 0755); err != nil {
-			log.Fatalf("cannot mkdir: %v", err)
-		}
-	default:
+	dst = filepath.Join(home, ".gomodproxy")
+	tmp = filepath.Join(dst, "@TEMP")
+	indexFile = filepath.Join(dst, "@INDEX")
+	if err := errors.Join(os.MkdirAll(dst, 0o755), os.MkdirAll(tmp, 0o755)); err != nil {
 		log.Fatal(err)
 	}
 
-	var bar *pb.ProgressBar
+	if *profile {
+		go func() {
+			runtime.SetBlockProfileRate(1) // aggresive
+			http.ListenAndServe(":6060", nil)
+		}()
+	}
+
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer cancel()
+	log.Println("using:", dst)
 
 	// Fetch the index from disk, or
 	// create a new index from scratch.
 	index := NewIndex(ctx)
+	defer func() {
+		// TODO(nealpatel): We really should be buffering
+		// writes to disk here because SIGKILL will make
+		// you lose all your work.
+		if err := index.Save(); err != nil {
+			println("failed to save index: ", err.Error())
+		}
+	}()
 
 	// Incrementally update the index in-place.
-	if err = index.Update(ctx, bar); err != nil {
-		log.Fatalf("failed to update index: %v", err)
+	if err = index.Update(ctx); err != nil {
+		log.Panicf("failed to update index: %v", err)
 	}
 
-	// Save the updated index for re-use.
-	if err = index.Save(); err != nil {
-		log.Fatalf("failed to save index: %v", err)
+	if *indexOnly {
+		return
 	}
-
-	// Instead of naively downloading all
-	// the code again, walk the local cache
-	// for all the (mod, vers) tuples.
-	modVersCache, err := alreadyDownloaded(ctx, bar, localGoModCache)
-	if err != nil {
-		log.Fatalf("failed to walk local disk for already downloaded modules: %v", err)
-	}
-
-	// TODO(nealpatel): Consider how an
-	// auxillary tool can be used to
-	// prune non-latest versions from a
-	// cache that gets incrementally
-	// updated.
-	_ = 0
-
-	// TODO(nealpatel) Remove outMu since the
-	// filesystem will synchronize for us.
-	outMu := &sync.Mutex{}
-
-	// TODO(nealpatel): Need to incrementally
-	// store these new versions at the HEAD
-	// of the module cache instead of tar.gz.
-	var out io.WriteCloser = os.Stdout
-	if *compress {
-		out = gzip.NewWriter(out)
-	}
-	tw := tar.NewWriter(out)
-
-	bar = pbTemplate.Start(len(index.Latest)).Set("prefix", "Fetching modules...")
 
 	var (
+		bar                = newProgress("Fetching modules...", int64(len(index.Latest)))
 		alreadyExists      int64
 		incrementalUpdates = make(map[string]string)
 	)
 	for path, version := range index.Latest {
-		// TODO: Use the official semvar
-		// equals function?
-		if modVersCache[path] == version {
+		if index.OnDisk[path] == version {
 			alreadyExists++
 			bar.Increment()
 			continue
@@ -182,10 +119,11 @@ func main() {
 		incrementalUpdates[path] = version
 	}
 
-	var wg sync.WaitGroup
-	upstreamSem := make(chan struct{}, 250)
-	gcpSem := make(chan struct{}, 1500)
-
+	var (
+		wg          sync.WaitGroup
+		upstreamSem = make(chan struct{}, 256)
+		gcpSem      = make(chan struct{}, 2048)
+	)
 	for path, version := range incrementalUpdates {
 		if err := ctx.Err(); err != nil { // slower than select+case, but ok
 			bar.Finish()
@@ -212,8 +150,27 @@ func main() {
 				return
 			}
 
+			// A non-recoverable signal could cause an
+			// inconsistent state to occur in which a
+			// latest module on disk does not need to
+			// be fetched but does need to be updated
+			// in the i.OnDisk.
+			escapedPath, err := module.EscapePath(path)
+			if err != nil {
+				bar.Error(path, " ", version, " ", err)
+				return
+			}
+			modDir := escapedPath + "@" + version
+			if _, err := os.Stat(filepath.Join(dst, modDir)); err == nil {
+				if err := index.Record(path, version); err != nil {
+					bar.Error(path, " ", version, " ", err)
+				}
+				return
+			}
+
 			modBytes, err := fetchMod(ctx, path, version)
 			switch err {
+			case nil:
 			case errorInvalidName:
 				invalidName.Add(1)
 				return
@@ -223,7 +180,6 @@ func main() {
 			default:
 				unknown.Add(1)
 				return
-			case nil:
 			}
 
 			mod, err := modfile.ParseLax(path+"@"+version, modBytes, nil)
@@ -277,34 +233,26 @@ func main() {
 			allBytes.Add(size)
 
 			zipBytesReader := bytes.NewReader(zipBytes)
-			z, err := zip.NewReader(zipBytesReader, size)
+			z, err := zip.NewReader(zipBytesReader, int64(len(zipBytes)))
 			if err != nil {
-				log.Println(path, version, err)
+				bar.Error(path, " ", version, " ", err)
 				return
 			}
 
 			var hasGoMod, hasGoFiles bool
-			var extractedSize uint64
 			var modSize uint64
 
 			// Walk through the files in the zip.
 			for _, f := range z.File {
 				modSize += f.UncompressedSize64
 				if strings.HasSuffix(f.Name, ".go") {
-					onlyGoSrcFiles.Add(1)
-					onlyGoSrcFilesSize.Add(f.UncompressedSize64)
 					hasGoFiles = true
 				}
 				if strings.HasSuffix(f.Name, "/go.mod") {
 					hasGoMod = true
 				}
-				if !ignoreFile(f.Name) {
-					extractedSize += f.UncompressedSize64
-				}
 			}
 
-			// Go modules containing 0% Go content
-			// are very intersting.
 			if !hasGoFiles {
 				noGoCode.Add(1)
 				nonGoSize.Add(modSize)
@@ -317,45 +265,58 @@ func main() {
 
 			good.Add(1)
 
-			// TODO(nealpatel) At this point, we know
-			// that we do not have this particular
-			// mod@vers saved. Instead of writing into
-			// an archive, update the localGoModCache
-			// in-place with this new version.
-
-			// TODO(nealpatel) Remove outMu since the
-			// filesystem will synchronize for us.
-			outMu.Lock()
-			defer outMu.Unlock()
+			buf := make([]byte, 32*1024)
 			for _, f := range z.File {
 				if ignoreFile(f.Name) {
 					continue
 				}
 
+				outPath := filepath.Join(tmp, f.Name)
+				if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
+					bar.Error(path, " ", version, " ", err)
+					return
+				}
+
 				src, err := z.Open(f.Name)
 				if err != nil {
-					log.Println(path, version, err)
+					bar.Error(path, " ", version, " ", err)
 					return
 				}
 
-				hdr := &tar.Header{
-					Name: f.Name,
-					Mode: 0664,
-					Size: int64(f.UncompressedSize64),
-				}
-				if err := tw.WriteHeader(hdr); err != nil {
-					log.Println(path, version, err)
-					return
-				}
-
-				n, err := io.Copy(tw, src)
+				out, err := os.Create(outPath)
 				if err != nil {
-					log.Println(path, version, err)
+					src.Close()
+					bar.Error(path, " ", version, " ", err)
 					return
 				}
 
+				n, err := io.CopyBuffer(struct{ io.Writer }{out}, src, buf)
+				src.Close()
+				out.Close()
+				if err != nil {
+					bar.Error(path, " ", version, " ", err)
+					return
+				}
+
+				if strings.HasSuffix(f.Name, ".go") {
+					onlyGoSrcFiles.Add(1)
+					onlyGoSrcFilesSize.Add(f.UncompressedSize64)
+				}
 				goFiles.Add(1)
 				goBytes.Add(n)
+			}
+
+			if err := os.MkdirAll(filepath.Join(dst, filepath.Dir(modDir)), 0o755); err != nil {
+				bar.Error(path, " ", version, " ", err)
+				return
+			}
+			if err := os.Rename(filepath.Join(tmp, modDir), filepath.Join(dst, modDir)); err != nil {
+				bar.Error(path, " ", version, " ", err)
+				return
+			}
+			if err := index.Record(path, version); err != nil {
+				bar.Error(path, " ", version, " ", err)
+				return
 			}
 		})
 	}
@@ -363,18 +324,6 @@ func main() {
 	wg.Wait()
 	bar.Finish()
 
-	if err := tw.Close(); err != nil {
-		log.Println(err)
-	}
-	if err := out.Close(); err != nil {
-		log.Println(err)
-	}
-
-	bar.Finish()
-
-	// ==================================================================== //
-	// *****                     Dump statistics.                     ***** //
-	// ==================================================================== //
 	fmt.Fprintf(os.Stderr, "\n")
 	fmt.Fprintf(os.Stderr, "Unique modules:       % 9d\n", len(index.Latest))
 	fmt.Fprintf(os.Stderr, "Already cached:       % 9d\n", alreadyExists)
@@ -393,146 +342,128 @@ func main() {
 	fmt.Fprintf(os.Stderr, "No .go files:         % 9d (%.1f GiB)\n", noGoCode.Load(), nonGoGiB)
 	fmt.Fprintf(os.Stderr, "                      ---------\n")
 	fmt.Fprintf(os.Stderr, "Valid:                % 9d\n", good.Load())
+	fmt.Fprintf(os.Stderr, "Pruned:               % 9d\n", index.pruned.Load())
 	fmt.Fprintf(os.Stderr, "\n")
-	fmt.Fprintf(os.Stderr, "Used index that as updated at %s.\n", index.UpdatedAt.Format("2006-01-02 15:04:05 MST"))
+	fmt.Fprintf(os.Stderr, "Used index that was updated at %s.\n", index.UpdatedAt.Format("2006-01-02 15:04:05 MST"))
 	fmt.Fprintf(os.Stderr, "Downloaded %d bytes (%d from GCS).\n", allBytes.Load(), gcsBytes.Load())
 	fmt.Fprintf(os.Stderr, "Wrote %d Go-related files (%d bytes).\n", goFiles.Load(), goBytes.Load())
 	fmt.Fprintf(os.Stderr, "Wrote %d .go source files (%d bytes).\n", onlyGoSrcFiles.Load(), onlyGoSrcFilesSize.Load())
 }
 
-// alreadyDownloaded provides a
-// mapping of mod -> vers in order to
-// perform incremental updates to locally
-// cached source code.
-func alreadyDownloaded(ctx context.Context, bar *pb.ProgressBar, root string) (map[string]string, error) {
-	bar = pbTemplate.Start(approxOnDiskModules).Set("prefix", "Building cache...")
-	defer bar.Finish()
+var (
+	gone            atomic.Int64
+	unknown         atomic.Int64
+	nilModOrModule  atomic.Int64
+	invalidName     atomic.Int64
+	vendor          atomic.Int64
+	spam            atomic.Int64
+	mismatchedGoMod atomic.Int64
+	invalidGoMod    atomic.Int64
+	noGoCode        atomic.Int64
+	noGoMod         atomic.Int64
+	gcsBytes        atomic.Int64
+	good            atomic.Int64
+	goBytes         atomic.Int64
+	allBytes        atomic.Int64
+	goFiles         atomic.Int64
+	nonGoSize       atomic.Uint64
 
-	var (
-		roots sync.Map
+	// Since goBytes and goFiles count
+	// all the extensions in ignoreFile
+	// it's not a true representation.
+	onlyGoSrcFiles     atomic.Int64
+	onlyGoSrcFilesSize atomic.Uint64
+)
 
-		mu    sync.Mutex
-		cache = make(map[string]string, approxOnDiskModules)
-	)
+type progress struct {
+	prefix string
+	total  int64
+	done   atomic.Int64
+	errs   atomic.Int64
+	start  time.Time
 
-	// Agnostic to whether or not a go.mod exists.
-	modVersResolver := func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-		if _, found := roots.Load(path); found {
-			return nil
-		}
+	mu      sync.Mutex
+	lastErr string
+}
 
-		_, modVers, found := strings.Cut(path, localGoModCache)
-		if !found {
-			log.Printf("unexpected: local cache prefix was not found?")
-			return nil
-		}
-		mod, vers, found := strings.Cut(modVers, "@")
-		if !found {
-			return nil
-		}
+func newProgress(prefix string, total int64) *progress {
+	return &progress{prefix: prefix, total: total, start: time.Now()}
+}
 
-		mu.Lock()
-		cache[mod[1:]] = vers // mod contains a leading slash
-		mu.Unlock()
-		bar.Increment()
-
-		// since d is a directory,
-		// this will skip looking
-		// into the mod@vers dir.
-		return filepath.SkipDir
+func (p *progress) Increment() {
+	if d := p.done.Add(1); d%71 == 0 || d == p.total {
+		p.render(d)
 	}
+}
 
-	var wg sync.WaitGroup
-	wsem := make(chan struct{}, 1<<11)
-
-	dirs, err := os.ReadDir(root)
-	if err != nil {
-		return nil, err
+func (p *progress) Error(args ...any) {
+	msg := fmt.Sprint(args...)
+	if i := strings.LastIndexByte(msg, ':'); i != -1 {
+		msg = strings.TrimSpace(msg[i+1:])
 	}
-	log.Printf("walking %d top-level directories ...", len(dirs))
+	p.mu.Lock()
+	p.lastErr = msg
+	p.mu.Unlock()
+	p.errs.Add(1)
+}
 
-	/*
-		% la HEAD | awk '{print $5 " " $9}' | sort -h | tail -10
-		86016 gopkg.in
-		135168 gitee.com
-		163840 gitlab.com
-		192512 .
-		16674816 github.com
-	*/
-	for _, dir := range dirs {
-		path := filepath.Join(root, dir.Name())
-		roots.Store(path, struct{}{})
-
-		// Spawn a goroutine for each top-level
-		// directory to shard the walking.
-		err = filepath.WalkDir(path, func(path string, d fs.DirEntry, werr error) error {
-			if werr != nil {
-				return werr
-			}
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			default:
-			}
-			if _, found := roots.Load(path); found {
-				return nil
-			}
-
-			roots.Store(path, struct{}{})
-			wsem <- struct{}{}
-			wg.Go(func() {
-				defer func() { <-wsem }()
-				_ = filepath.WalkDir(path, modVersResolver)
-			})
-			return filepath.SkipDir
-		})
-		if err != nil {
-			return nil, err
-		}
+func (p *progress) render(done int64) {
+	elapsed := time.Since(p.start).Truncate(time.Second)
+	p.mu.Lock()
+	lastErr := p.lastErr
+	p.mu.Unlock()
+	var counter string
+	if p.total > 0 {
+		counter = fmt.Sprintf("%d/%d", done, p.total)
+	} else {
+		counter = strconv.FormatInt(done, 10)
 	}
-	wg.Wait()
-	return cache, nil
+	if errs := p.errs.Load(); errs > 0 {
+		fmt.Fprintf(os.Stderr, "\r\x1b[2K%s %s %s [%d errors] %s", p.prefix, counter, elapsed, errs, lastErr)
+	} else {
+		fmt.Fprintf(os.Stderr, "\r\x1b[2K%s %s %s", p.prefix, counter, elapsed)
+	}
+}
+
+func (p *progress) Finish() {
+	p.render(p.done.Load())
+	fmt.Fprint(os.Stderr, "\n")
 }
 
 func NewIndex(ctx context.Context) *Index {
 	var i Index
-	i.outFile = "data/HEAD.index"
 
-	// Backup the current HEAD if it already exists.
-	_, err := os.Stat(i.outFile)
-	switch err {
-	case nil:
-		// Read the current HEAD.
-		file, err := os.ReadFile(i.outFile)
-		if err != nil {
-			log.Fatalf("cannot read %q: %v", i.outFile, err)
+	_, err := os.Stat(indexFile)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		log.Println("building new INDEX (this may take a while)")
+		i = Index{
+			Latest: make(map[string]string),
+			OnDisk: make(map[string]string),
 		}
-		gob.NewDecoder(bytes.NewBuffer(file)).Decode(&i)
 
-		// Backup the previous HEAD.
-		f, err := os.Create(fmt.Sprintf("data/HEAD.%s.index", i.UpdatedAt.Format("20060102_150405")))
+	case err != nil:
+		log.Fatalf("cannot stat %q: %v", indexFile, err)
+
+	default:
+		file, err := os.ReadFile(indexFile)
+		if err != nil {
+			log.Fatalf("cannot read %q: %v", indexFile, err)
+		}
+		if err := gob.NewDecoder(bytes.NewBuffer(file)).Decode(&i); err != nil {
+			log.Fatalf("cannot decode %q: %v", indexFile, err)
+		}
+
+		// Backup the previous INDEX.
+		i.backupFile = indexFile + "." + strconv.Itoa(int(time.Now().UnixMilli()))
+		f, err := os.Create(i.backupFile)
 		if err != nil {
 			log.Fatal(err)
 		}
 		defer f.Close()
-		if err = gob.NewEncoder(f).Encode(i); err != nil {
-			log.Panicf("could backup %s: %v", i.outFile, err)
+		if err = gob.NewEncoder(f).Encode(&i); err != nil {
+			log.Fatalf("could not backup %s: %v", indexFile, err)
 		}
-
-	case os.ErrNotExist:
-		log.Printf("no %q found; building new HEAD from scratch (this may take a while)", i.outFile)
-		i = Index{Latest: make(map[string]string)}
-
-	default:
-		log.Fatalf("cannot stat %q: %v", i.outFile, err)
 	}
 
 	// Set last such that duplicates since
@@ -551,74 +482,80 @@ func NewIndex(ctx context.Context) *Index {
 }
 
 type Index struct {
-	Latest        map[string]string
-	UpdatedAt     time.Time
-	TotalVersions uint64
+	mu     sync.Mutex
+	Latest map[string]string
+	OnDisk map[string]string
 
-	outFile string
+	UpdatedAt time.Time
 
-	last time.Time
-	d    *json.Decoder
+	pruned     atomic.Int64
+	backupFile string
+	last       time.Time
+	d          *json.Decoder
 }
 
-func (i *Index) Update(ctx context.Context, bar *pb.ProgressBar) error {
-	latest, err := fetchLatest(ctx)
-	if err != nil {
-		return err
+func (i *Index) Record(path, version string) error {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	if old, ok := i.OnDisk[path]; ok && old != version {
+		ep, err := module.EscapePath(path)
+		if err != nil {
+			return err
+		}
+		if err := os.RemoveAll(filepath.Join(dst, ep+"@"+old)); err != nil {
+			return err
+		}
+		i.pruned.Add(1)
 	}
-	tree, err := tlog.ParseTree(latest)
-	if err != nil {
-		return err
-	}
-	N := tree.N - int64(i.TotalVersions)
+	i.OnDisk[path] = version
+	return nil
+}
 
-	if N <= 0 {
-		const cacheFmt = "\tLatest: %d\n\tTotal Versions: %d\n\tUpdatedAt: %s"
-		log.Printf("no updates for index\n{\n%s\n}",
-			fmt.Sprintf(cacheFmt,
-				len(i.Latest),
-				i.TotalVersions,
-				i.UpdatedAt.Format("2006-01-02 15:04:05 UTC")),
-		)
-		return nil
-	}
-
-	bar = pbTemplate.Start64(N).Set("prefix", "Updating index...")
+func (i *Index) Update(ctx context.Context) error {
+	bar := newProgress("Updating index...", 0)
 	defer bar.Finish()
 
-	i.TotalVersions = uint64(tree.N)
-
-	var linesSeen uint64
+	var newMod, changedMod int
 	for {
 		v, err := i.next(ctx)
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
-			log.Fatal(err)
+			return err
 		}
-		linesSeen++
 		bar.Increment()
 
-		if semver.Compare(v.Version, i.Latest[v.Path]) >= 0 {
+		vers, ok := i.Latest[v.Path]
+		if !ok {
+			newMod++
+		}
+		if semver.Compare(v.Version, vers) >= 0 {
 			i.Latest[v.Path] = v.Version
+			if ok {
+				changedMod++
+			}
 		}
 	}
 
+	log.Printf("index: %d new modules, %d new versions", newMod, changedMod)
 	return nil
 }
 
 func (i *Index) Save() error {
-	if err := os.Remove(i.outFile); err != nil {
-		log.Printf("warn: cannot remove %q: %v", i.outFile, err)
+	if err := os.Remove(indexFile); err != nil {
+		log.Printf("warn: cannot remove %q: %v", indexFile, err)
 	}
-	f, err := os.Create(i.outFile)
+	f, err := os.Create(indexFile)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
-	if err = gob.NewEncoder(f).Encode(*i); err != nil {
+	if err = gob.NewEncoder(f).Encode(i); err != nil {
 		return err
+	}
+	if i.backupFile != "" {
+		os.Remove(i.backupFile)
 	}
 	return nil
 }
@@ -660,19 +597,6 @@ func newRequestWithContext(ctx context.Context, method, url string) *http.Reques
 type Version struct {
 	Path, Version string
 	Timestamp     time.Time
-}
-
-func fetchLatest(ctx context.Context) ([]byte, error) {
-	url := "https://sum.golang.org/latest"
-	res, err := httpClient.Do(newRequestWithContext(ctx, "GET", url))
-	if err != nil {
-		return nil, err
-	}
-	defer res.Body.Close()
-	if res.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("GET %q: %v", url, res.Status)
-	}
-	return io.ReadAll(res.Body)
 }
 
 var errorInvalidName = errors.New("invalid name")
