@@ -221,31 +221,59 @@ func main() {
 				defer func() { <-gcpSem }()
 			}
 
-			// Download the source zip for path@version.
-			zipBytes, err := fetchZip(ctx, path, version)
-			switch err {
-			case nil:
-			case errorGone:
-				gone.Add(1)
-				return
-			default:
-				unknown.Add(1)
-				return
+			// Prevent an unlucky cluster of large modules
+			// from potentially causing an OOM while not
+			// slowing down the common path.
+			var (
+				z          *zip.Reader
+				zipCleanup = func() {}
+			)
+			defer func() { zipCleanup() }()
+			if size > 100<<20 {
+				f, err := fetchZipToFile(ctx, path, version)
+				switch err {
+				case nil:
+				case errorGone:
+					gone.Add(1)
+					return
+				default:
+					unknown.Add(1)
+					return
+				}
+				zipCleanup = func() { f.Close(); os.Remove(f.Name()) }
+				fi, err := f.Stat()
+				if err != nil {
+					bar.Error(path, " ", version, " ", err)
+					return
+				}
+				z, err = zip.NewReader(f, fi.Size())
+				if err != nil {
+					bar.Error(path, " ", version, " ", err)
+					return
+				}
+			} else {
+				zipBytes, err := fetchZip(ctx, path, version)
+				switch err {
+				case nil:
+				case errorGone:
+					gone.Add(1)
+					return
+				default:
+					unknown.Add(1)
+					return
+				}
+				z, err = zip.NewReader(bytes.NewReader(zipBytes), int64(len(zipBytes)))
+				if err != nil {
+					bar.Error(path, " ", version, " ", err)
+					return
+				}
 			}
 
 			allBytes.Add(size)
 
-			zipBytesReader := bytes.NewReader(zipBytes)
-			z, err := zip.NewReader(zipBytesReader, int64(len(zipBytes)))
-			if err != nil {
-				bar.Error(path, " ", version, " ", err)
-				return
-			}
-
 			var hasGoMod, hasGoFiles bool
 			var modSize uint64
 
-			// Walk through the files in the zip.
 			for _, f := range z.File {
 				modSize += f.UncompressedSize64
 				if strings.HasSuffix(f.Name, ".go") {
@@ -716,6 +744,39 @@ func fetchZipHead(ctx context.Context, path, version string) (string, int64, err
 		return "", 0, fmt.Errorf("HEAD %q: %v", url, res.Status)
 	}
 	return res.Request.URL.String(), res.ContentLength, nil
+}
+
+func fetchZipToFile(ctx context.Context, path, version string) (*os.File, error) {
+	url, err := proxyURL(path, version, ".zip")
+	if err != nil {
+		return nil, err
+	}
+	res, err := httpClient.Do(newRequestWithContext(ctx, "GET", url))
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+	if res.StatusCode == http.StatusGone || res.StatusCode == http.StatusNotFound {
+		return nil, errorGone
+	}
+	if res.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("GET %q: %v", url, res.Status)
+	}
+	f, err := os.CreateTemp(tmp, "*.zip")
+	if err != nil {
+		return nil, err
+	}
+	if _, err := io.Copy(f, res.Body); err != nil {
+		f.Close()
+		os.Remove(f.Name())
+		return nil, err
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		f.Close()
+		os.Remove(f.Name())
+		return nil, err
+	}
+	return f, nil
 }
 
 func fetchZip(ctx context.Context, path, version string) ([]byte, error) {
