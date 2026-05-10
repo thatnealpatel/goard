@@ -93,6 +93,10 @@ func main() {
 		}
 	}()
 
+	if err := index.Recover(); err != nil {
+		log.Panicf("failed to recover index: %v", err)
+	}
+
 	// Incrementally update the index in-place.
 	if err = index.Update(ctx); err != nil {
 		log.Panicf("failed to update index: %v", err)
@@ -561,6 +565,54 @@ func (i *Index) Save() error {
 	}
 	defer f.Close()
 	return gob.NewEncoder(f).Encode(i)
+}
+
+func (i *Index) Recover() error {
+	bar := newProgress("Recovering index...", 0)
+	defer bar.Finish()
+
+	var recovered int
+	err := filepath.WalkDir(dst, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if !d.IsDir() {
+			return nil
+		}
+		if d.Name()[0] == '@' {
+			return filepath.SkipDir
+		}
+		if !strings.ContainsRune(d.Name(), '@') {
+			return nil
+		}
+
+		rel, err := filepath.Rel(dst, path)
+		if err != nil {
+			return nil
+		}
+		lastAt := strings.LastIndexByte(rel, '@')
+		escapedPath := rel[:lastAt]
+		version := rel[lastAt+1:]
+
+		modPath, err := module.UnescapePath(escapedPath)
+		if err != nil {
+			return filepath.SkipDir
+		}
+
+		if _, ok := i.OnDisk[modPath]; !ok {
+			i.OnDisk[modPath] = version
+			recovered++
+			bar.Increment()
+		}
+		return filepath.SkipDir
+	})
+	if err != nil {
+		return err
+	}
+	if recovered > 0 {
+		log.Printf("recovered %d modules from disk", recovered)
+	}
+	return nil
 }
 
 func (i *Index) Close() error {
