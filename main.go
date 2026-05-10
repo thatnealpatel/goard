@@ -52,6 +52,7 @@ func main() {
 	var (
 		profile   = flag.Bool("pprof", false, "enable profiling endpoint.")
 		all       = flag.Bool("all", false, "include potential forks (mismatching and missing go.mod)")
+		verify    = flag.Bool("verify", false, "recover index from disk before updating")
 		indexOnly = flag.Bool("index", false, "update index only")
 	)
 	flag.Parse()
@@ -93,8 +94,10 @@ func main() {
 		}
 	}()
 
-	if err := index.Recover(); err != nil {
-		log.Panicf("failed to recover index: %v", err)
+	if *verify {
+		if err := index.Recover(); err != nil {
+			log.Panicf("failed to recover index: %v", err)
+		}
 	}
 
 	// Incrementally update the index in-place.
@@ -439,11 +442,7 @@ func newProgress(prefix string, total int64) *progress {
 	return &progress{prefix: prefix, total: total, start: time.Now()}
 }
 
-func (p *progress) Increment() {
-	if d := p.done.Add(1); d%71 == 0 || d == p.total {
-		p.render(d)
-	}
-}
+func (p *progress) Increment() { p.render(p.done.Add(1)) }
 
 func (p *progress) Error(args ...any) {
 	msg := fmt.Sprint(args...)
@@ -562,7 +561,6 @@ func (i *Index) Record(path, version string) error {
 
 func (i *Index) Update(ctx context.Context) error {
 	bar := newProgress("Updating index...", 0)
-	defer bar.Finish()
 
 	var newMod, changedMod int
 	for {
@@ -587,6 +585,7 @@ func (i *Index) Update(ctx context.Context) error {
 		}
 	}
 
+	bar.Finish()
 	log.Printf("index: %d new modules, %d new versions", newMod, changedMod)
 	return nil
 }
@@ -606,10 +605,10 @@ func (i *Index) Save() error {
 }
 
 func (i *Index) Recover() error {
-	bar := newProgress("Recovering index...", 0)
-	defer bar.Finish()
+	fmt.Fprint(os.Stderr, "Verifying index... (may take a while)")
 
 	var recovered int
+	var bar *progress
 	err := filepath.WalkDir(dst, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return nil
@@ -640,6 +639,10 @@ func (i *Index) Recover() error {
 		if _, ok := i.OnDisk[modPath]; !ok {
 			i.OnDisk[modPath] = version
 			recovered++
+			if bar == nil {
+				fmt.Fprint(os.Stderr, "\n")
+				bar = newProgress("Recovering index...", 0)
+			}
 			bar.Increment()
 		}
 		return filepath.SkipDir
@@ -647,7 +650,10 @@ func (i *Index) Recover() error {
 	if err != nil {
 		return err
 	}
-	if recovered > 0 {
+	if recovered == 0 {
+		fmt.Fprint(os.Stderr, " ok\n")
+	} else {
+		bar.Finish()
 		log.Printf("recovered %d modules from disk", recovered)
 	}
 	return nil
