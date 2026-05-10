@@ -296,13 +296,18 @@ func main() {
 
 			good.Add(1)
 
-			buf := make([]byte, 32*1024)
+			var (
+				extracted bool
+				zipPrefix = path + "@" + version + "/"
+				buf       = make([]byte, 32*1024)
+			)
 			for _, f := range z.File {
 				if ignoreFile(f.Name) {
 					continue
 				}
 
-				outPath := filepath.Join(tmp, f.Name)
+				rel := strings.TrimPrefix(f.Name, zipPrefix)
+				outPath := filepath.Join(tmp, modDir, rel)
 				if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
 					bar.Error(path, " ", version, " ", err)
 					return
@@ -333,8 +338,13 @@ func main() {
 					onlyGoSrcFiles.Add(1)
 					onlyGoSrcFilesSize.Add(f.UncompressedSize64)
 				}
+				extracted = true
 				goFiles.Add(1)
 				goBytes.Add(n)
+			}
+
+			if !extracted {
+				return
 			}
 
 			if err := os.MkdirAll(filepath.Join(dst, filepath.Dir(modDir)), 0o755); err != nil {
