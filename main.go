@@ -88,10 +88,7 @@ func main() {
 	// create a new index from scratch.
 	index := NewIndex(ctx)
 	defer func() {
-		// TODO(nealpatel): We really should be buffering
-		// writes to disk here because SIGKILL will make
-		// you lose all your work.
-		if err := index.Save(); err != nil {
+		if err := index.Close(); err != nil {
 			println("failed to save index: ", err.Error())
 		}
 	}()
@@ -123,7 +120,9 @@ func main() {
 		wg          sync.WaitGroup
 		upstreamSem = make(chan struct{}, 256)
 		gcpSem      = make(chan struct{}, 2048)
+		lastSave    atomic.Int64
 	)
+	lastSave.Store(time.Now().UnixMilli())
 	for path, version := range incrementalUpdates {
 		if err := ctx.Err(); err != nil { // slower than select+case, but ok
 			bar.Finish()
@@ -317,6 +316,14 @@ func main() {
 			if err := index.Record(path, version); err != nil {
 				bar.Error(path, " ", version, " ", err)
 				return
+			}
+
+			if ts := lastSave.Load(); time.Since(time.UnixMilli(ts)) > 30*time.Second {
+				if lastSave.CompareAndSwap(ts, time.Now().UnixMilli()) {
+					if err := index.Save(); err != nil {
+						bar.Error("checkpoint: ", err)
+					}
+				}
 			}
 		})
 	}
@@ -543,6 +550,8 @@ func (i *Index) Update(ctx context.Context) error {
 }
 
 func (i *Index) Save() error {
+	i.mu.Lock()
+	defer i.mu.Unlock()
 	if err := os.Remove(indexFile); err != nil {
 		log.Printf("warn: cannot remove %q: %v", indexFile, err)
 	}
@@ -551,7 +560,11 @@ func (i *Index) Save() error {
 		return err
 	}
 	defer f.Close()
-	if err = gob.NewEncoder(f).Encode(i); err != nil {
+	return gob.NewEncoder(f).Encode(i)
+}
+
+func (i *Index) Close() error {
+	if err := i.Save(); err != nil {
 		return err
 	}
 	if i.backupFile != "" {
