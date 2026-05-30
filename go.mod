@@ -1,4 +1,4 @@
-module github.com/thatnealpatel/goard
+module patel.codes/goard
 
 go 1.26.3
 
