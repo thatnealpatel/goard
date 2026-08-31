@@ -90,7 +90,7 @@ func main() {
 	index := NewIndex(ctx)
 	defer func() {
 		if err := index.Close(); err != nil {
-			println("failed to save index: ", err.Error())
+			log.Println("failed to save index:", err)
 		}
 	}()
 
@@ -540,6 +540,7 @@ type Index struct {
 	backupFile string
 	last       time.Time
 	d          *json.Decoder
+	body       io.ReadCloser
 }
 
 func (i *Index) Record(path, version string) error {
@@ -577,9 +578,9 @@ func (i *Index) Update(ctx context.Context) error {
 		if !ok {
 			newMod++
 		}
-		if semver.Compare(v.Version, vers) >= 0 {
+		if c := semver.Compare(v.Version, vers); c >= 0 {
 			i.Latest[v.Path] = v.Version
-			if ok {
+			if ok && c > 0 {
 				changedMod++
 			}
 		}
@@ -593,15 +594,20 @@ func (i *Index) Update(ctx context.Context) error {
 func (i *Index) Save() error {
 	i.mu.Lock()
 	defer i.mu.Unlock()
-	if err := os.Remove(indexFile); err != nil {
-		log.Printf("warn: cannot remove %q: %v", indexFile, err)
-	}
-	f, err := os.Create(indexFile)
+	f, err := os.CreateTemp(filepath.Dir(indexFile), "@INDEX.tmp.*")
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-	return gob.NewEncoder(f).Encode(i)
+	if err := gob.NewEncoder(f).Encode(i); err != nil {
+		f.Close()
+		os.Remove(f.Name())
+		return err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(f.Name())
+		return err
+	}
+	return os.Rename(f.Name(), indexFile)
 }
 
 func (i *Index) Recover() error {
@@ -660,6 +666,10 @@ func (i *Index) Recover() error {
 }
 
 func (i *Index) Close() error {
+	if i.body != nil {
+		i.body.Close()
+		i.body = nil
+	}
 	if err := i.Save(); err != nil {
 		return err
 	}
@@ -686,12 +696,21 @@ func (i *Index) next(ctx context.Context) (*Version, error) {
 }
 
 func (i *Index) nextPage(ctx context.Context) error {
+	if i.body != nil {
+		i.body.Close()
+		i.body = nil
+	}
 	url := "https://index.golang.org/index?since=" + i.last.Add(1).Format(time.RFC3339Nano)
-	req, err := httpClient.Do(newRequestWithContext(ctx, "GET", url))
+	res, err := httpClient.Do(newRequestWithContext(ctx, "GET", url))
 	if err != nil {
 		return err
 	}
-	i.d = json.NewDecoder(req.Body)
+	if res.StatusCode != http.StatusOK {
+		res.Body.Close()
+		return fmt.Errorf("GET %q: %v", url, res.Status)
+	}
+	i.body = res.Body
+	i.d = json.NewDecoder(res.Body)
 	return nil
 }
 
