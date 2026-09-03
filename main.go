@@ -9,10 +9,11 @@ package main
 
 import (
 	"archive/zip"
+	"bufio"
 	"bytes"
 	"context"
-	"encoding/gob"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"flag"
 	"fmt"
@@ -54,16 +55,11 @@ var (
 func main() {
 	var (
 		profile   = flag.Bool("pprof", false, "enable profiling endpoint.")
-		verify    = flag.Bool("verify", false, "recover index from disk before updating")
 		indexOnly = flag.Bool("index", false, "update index only")
 	)
 	flag.Parse()
 
 	log.SetFlags(log.Lshortfile | log.Flags())
-
-	gob.Register(map[string]string{})
-	gob.Register(time.Time{})
-	gob.Register(Index{})
 
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -72,7 +68,9 @@ func main() {
 	dst = filepath.Join(home, ".gomodproxy")
 	tmp = filepath.Join(dst, "@TEMP")
 	indexFile = filepath.Join(dst, "@INDEX")
-	if err := errors.Join(os.MkdirAll(dst, 0o755), os.MkdirAll(tmp, 0o755)); err != nil {
+	// Anything left in tmp is from an interrupted
+	// run and was never recorded in the index.
+	if err := errors.Join(os.MkdirAll(dst, 0o755), os.RemoveAll(tmp), os.MkdirAll(tmp, 0o755)); err != nil {
 		log.Fatal(err)
 	}
 
@@ -96,12 +94,6 @@ func main() {
 		}
 	}()
 
-	if *verify {
-		if err := index.Recover(); err != nil {
-			log.Panicf("failed to recover index: %v", err)
-		}
-	}
-
 	// Incrementally update the index in-place.
 	if err = index.Update(ctx); err != nil {
 		log.Panicf("failed to update index: %v", err)
@@ -112,17 +104,23 @@ func main() {
 	}
 
 	var (
-		bar                = newProgress("Fetching modules...", int64(len(index.Latest)))
+		bar                = newProgress("Fetching modules...", int64(len(index.Mods)))
 		alreadyExists      int64
+		alreadyRejected    int64
 		incrementalUpdates = make(map[string]string)
 	)
-	for path, version := range index.Latest {
-		if index.OnDisk[path] == version {
+	for path, e := range index.Mods {
+		version := e.Latest()
+		switch version {
+		case e.OnDisk:
 			alreadyExists++
-			bar.Increment()
+		case e.Rejected:
+			alreadyRejected++
+		default:
+			incrementalUpdates[path] = version
 			continue
 		}
-		incrementalUpdates[path] = version
+		bar.Increment()
 	}
 
 	var (
@@ -156,29 +154,20 @@ func main() {
 				return
 			}
 
-			// A non-recoverable signal could cause an
-			// inconsistent state to occur in which a
-			// latest module on disk does not need to
-			// be fetched but does need to be updated
-			// in the i.OnDisk.
 			escapedPath, err := module.EscapePath(path)
 			if err != nil {
-				bar.Error(path, " ", version, " ", err)
+				invalidName.Add(1)
+				index.Reject(path, version)
 				return
 			}
 			modDir := escapedPath + "@" + version
-			if _, err := os.Stat(filepath.Join(dst, modDir)); err == nil {
-				if err := index.Record(path, version); err != nil {
-					bar.Error(path, " ", version, " ", err)
-				}
-				return
-			}
 
 			modBytes, err := fetchMod(ctx, path, version)
 			switch err {
 			case nil:
 			case errorInvalidName:
 				invalidName.Add(1)
+				index.Reject(path, version)
 				return
 			case errorGone:
 				gone.Add(1)
@@ -192,6 +181,7 @@ func main() {
 			switch {
 			case err != nil:
 				invalidGoMod.Add(1)
+				index.Reject(path, version)
 				return
 			case mod == nil || mod.Module == nil:
 				// Without this invariant, panic
@@ -200,9 +190,11 @@ func main() {
 				// e.g.
 				// github.com/maka8ka/faygo/client@v0.0.0-20220420085059-439b6b39f779
 				nilModOrModule.Add(1)
+				index.Reject(path, version)
 				return
 			case mod.Module.Mod.Path != path:
 				mismatchedGoMod.Add(1)
+				index.Reject(path, version)
 				return
 			default:
 			}
@@ -234,6 +226,7 @@ func main() {
 					prefilterSkipped.Add(1)
 					prefilterSaved.Add(size - int64(len(tail.data)))
 					noGoMod.Add(1)
+					index.Reject(path, version)
 					return
 				}
 			}
@@ -323,6 +316,7 @@ func main() {
 
 			if !hasGoMod {
 				noGoMod.Add(1)
+				index.Reject(path, version)
 				return
 			}
 
@@ -330,6 +324,7 @@ func main() {
 
 			var (
 				extracted bool
+				written   int64
 				zipPrefix = path + "@" + version + "/"
 				buf       = make([]byte, 32*1024)
 			)
@@ -371,6 +366,7 @@ func main() {
 					onlyGoSrcFilesSize.Add(f.UncompressedSize64)
 				}
 				extracted = true
+				written += n
 				goFiles.Add(1)
 				goBytes.Add(n)
 			}
@@ -383,11 +379,18 @@ func main() {
 				bar.Error(path, " ", version, " ", err)
 				return
 			}
+			// The index is canonical: a directory it does
+			// not know about is a leftover from an
+			// interrupted run, not a cached module.
+			if err := os.RemoveAll(filepath.Join(dst, modDir)); err != nil {
+				bar.Error(path, " ", version, " ", err)
+				return
+			}
 			if err := os.Rename(filepath.Join(tmp, modDir), filepath.Join(dst, modDir)); err != nil {
 				bar.Error(path, " ", version, " ", err)
 				return
 			}
-			if err := index.Record(path, version); err != nil {
+			if err := index.Record(path, version, written); err != nil {
 				bar.Error(path, " ", version, " ", err)
 				return
 			}
@@ -406,8 +409,9 @@ func main() {
 	bar.Finish()
 
 	fmt.Fprintf(os.Stderr, "\n")
-	fmt.Fprintf(os.Stderr, "Unique modules:       % 9d\n", len(index.Latest))
+	fmt.Fprintf(os.Stderr, "Unique modules:       % 9d\n", len(index.Mods))
 	fmt.Fprintf(os.Stderr, "Already cached:       % 9d\n", alreadyExists)
+	fmt.Fprintf(os.Stderr, "Already rejected:     % 9d\n", alreadyRejected)
 	fmt.Fprintf(os.Stderr, "Vendor paths:         % 9d\n", vendor.Load())
 	fmt.Fprintf(os.Stderr, "Spam:                 % 9d\n", spam.Load())
 	fmt.Fprintf(os.Stderr, "Invalid names:        % 9d\n", invalidName.Load())
@@ -430,6 +434,7 @@ func main() {
 	fmt.Fprintf(os.Stderr, "Tail probes fetched %d bytes (%d whole zips, %d directory fallbacks).\n", tailBytes.Load(), prefilterWhole.Load(), prefilterFallback.Load())
 	fmt.Fprintf(os.Stderr, "Wrote %d Go-related files (%d bytes).\n", goFiles.Load(), goBytes.Load())
 	fmt.Fprintf(os.Stderr, "Wrote %d .go source files (%d bytes).\n", onlyGoSrcFiles.Load(), onlyGoSrcFilesSize.Load())
+	fmt.Fprintf(os.Stderr, "Corpus on disk: %d bytes.\n", index.Total())
 }
 
 var (
@@ -518,35 +523,26 @@ func (p *progress) Finish() {
 func NewIndex(ctx context.Context) *Index {
 	var i Index
 
-	_, err := os.Stat(indexFile)
+	i.Mods = make(map[string]Entry)
+	f, err := os.Open(indexFile)
 	switch {
 	case errors.Is(err, os.ErrNotExist):
 		log.Println("building new INDEX (this may take a while)")
-		i = Index{
-			Latest: make(map[string]string),
-			OnDisk: make(map[string]string),
-		}
 
 	case err != nil:
-		log.Fatalf("cannot stat %q: %v", indexFile, err)
+		log.Fatalf("cannot open %q: %v", indexFile, err)
 
 	default:
-		file, err := os.ReadFile(indexFile)
-		if err != nil {
-			log.Fatalf("cannot read %q: %v", indexFile, err)
-		}
-		if err := gob.NewDecoder(bytes.NewBuffer(file)).Decode(&i); err != nil {
+		if err := i.load(f); err != nil {
 			log.Fatalf("cannot decode %q: %v", indexFile, err)
 		}
+		f.Close()
 
-		// Backup the previous INDEX.
+		// Backup the previous INDEX. Save replaces
+		// indexFile by rename, so a hard link keeps
+		// the old contents without copying them.
 		i.backupFile = indexFile + "." + strconv.Itoa(int(time.Now().UnixMilli()))
-		f, err := os.Create(i.backupFile)
-		if err != nil {
-			log.Fatal(err)
-		}
-		defer f.Close()
-		if err = gob.NewEncoder(f).Encode(&i); err != nil {
+		if err := os.Link(indexFile, i.backupFile); err != nil {
 			log.Fatalf("could not backup %s: %v", indexFile, err)
 		}
 	}
@@ -566,35 +562,144 @@ func NewIndex(ctx context.Context) *Index {
 	return &i
 }
 
+// Entry is everything the index knows
+// about one module path.
+//
+// Release, Prerelease, and Pseudo hold
+// the highest version seen in each class.
+// Latest picks among them the way the go
+// command resolves @latest. +incompatible
+// versions are never recorded: they have
+// no go.mod by definition and would
+// always be rejected.
+type Entry struct {
+	Release    string `json:",omitzero"`
+	Prerelease string `json:",omitzero"`
+	Pseudo     string `json:",omitzero"`
+
+	OnDisk   string `json:",omitzero"` // version extracted under dst, if any
+	Rejected string `json:",omitzero"` // version evaluated and skipped; retried only if Latest moves
+	Bytes    int64  `json:",omitzero"` // bytes written for OnDisk
+}
+
+// record is one line of the index file. The first line carries
+// UpdatedAt and no Path; every other line is an Entry keyed by Path.
+type record struct {
+	Path      string    `json:",omitzero"`
+	UpdatedAt time.Time `json:",omitzero"`
+	Entry
+}
+
+// Latest returns the version @latest
+// resolves to, or "" if the module has
+// no eligible version.
+func (e Entry) Latest() string {
+	switch {
+	case e.Release != "":
+		return e.Release
+	case e.Prerelease != "":
+		return e.Prerelease
+	default:
+		return e.Pseudo
+	}
+}
+
+// observe folds a version from the index
+// feed into the entry and reports whether
+// Latest changed.
+func (e *Entry) observe(v string) bool {
+	if semver.Build(v) == "+incompatible" {
+		return false
+	}
+	slot := &e.Release
+	switch {
+	case module.IsPseudoVersion(v):
+		slot = &e.Pseudo
+	case semver.Prerelease(v) != "":
+		slot = &e.Prerelease
+	}
+	if semver.Compare(v, *slot) <= 0 {
+		return false
+	}
+	before := e.Latest()
+	*slot = v
+	return e.Latest() != before
+}
+
 type Index struct {
-	mu     sync.Mutex
-	Latest map[string]string
-	OnDisk map[string]string
+	mu   sync.Mutex
+	Mods map[string]Entry
 
 	UpdatedAt time.Time
 
 	pruned     atomic.Int64
 	backupFile string
 	last       time.Time
-	d          *json.Decoder
+	d          *jsontext.Decoder
 	body       io.ReadCloser
 }
 
-func (i *Index) Record(path, version string) error {
+// load reads an index written by Save.
+func (i *Index) load(r io.Reader) error {
+	dec := jsontext.NewDecoder(bufio.NewReaderSize(r, 1<<20))
+	for {
+		var rec record
+		err := json.UnmarshalDecode(dec, &rec, json.RejectUnknownMembers(true))
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if rec.Path == "" {
+			i.UpdatedAt = rec.UpdatedAt
+			continue
+		}
+		i.Mods[rec.Path] = rec.Entry
+	}
+}
+
+// Record marks version as extracted under dst with n bytes
+// written, pruning any previously extracted version of the
+// module.
+func (i *Index) Record(path, version string, n int64) error {
 	i.mu.Lock()
 	defer i.mu.Unlock()
-	if old, ok := i.OnDisk[path]; ok && old != version {
+	e := i.Mods[path]
+	if e.OnDisk != "" && e.OnDisk != version {
 		ep, err := module.EscapePath(path)
 		if err != nil {
 			return err
 		}
-		if err := os.RemoveAll(filepath.Join(dst, ep+"@"+old)); err != nil {
+		if err := os.RemoveAll(filepath.Join(dst, ep+"@"+e.OnDisk)); err != nil {
 			return err
 		}
 		i.pruned.Add(1)
 	}
-	i.OnDisk[path] = version
+	e.OnDisk, e.Bytes = version, n
+	i.Mods[path] = e
 	return nil
+}
+
+// Reject marks version as evaluated and not
+// worth extracting. It is not retried until
+// the module's Latest moves past it.
+func (i *Index) Reject(path, version string) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	e := i.Mods[path]
+	e.Rejected = version
+	i.Mods[path] = e
+}
+
+// Total returns the bytes written for every module on disk.
+func (i *Index) Total() (n int64) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	for _, e := range i.Mods {
+		n += e.Bytes
+	}
+	return n
 }
 
 func (i *Index) Update(ctx context.Context) error {
@@ -611,15 +716,15 @@ func (i *Index) Update(ctx context.Context) error {
 		}
 		bar.Increment()
 
-		vers, ok := i.Latest[v.Path]
-		if !ok {
-			newMod++
+		e, ok := i.Mods[v.Path]
+		if !e.observe(v.Version) {
+			continue
 		}
-		if c := semver.Compare(v.Version, vers); c >= 0 {
-			i.Latest[v.Path] = v.Version
-			if ok && c > 0 {
-				changedMod++
-			}
+		i.Mods[v.Path] = e
+		if ok {
+			changedMod++
+		} else {
+			newMod++
 		}
 	}
 
@@ -628,78 +733,40 @@ func (i *Index) Update(ctx context.Context) error {
 	return nil
 }
 
+// Save atomically replaces the index file. The map is snapshotted
+// under the lock so workers are not stalled for the encode.
 func (i *Index) Save() error {
 	i.mu.Lock()
-	defer i.mu.Unlock()
+	recs := make([]record, 0, len(i.Mods))
+	for path, e := range i.Mods {
+		recs = append(recs, record{Path: path, Entry: e})
+	}
+	updatedAt := i.UpdatedAt
+	i.mu.Unlock()
+
 	f, err := os.CreateTemp(filepath.Dir(indexFile), "@INDEX.tmp.*")
 	if err != nil {
 		return err
 	}
-	if err := gob.NewEncoder(f).Encode(i); err != nil {
-		f.Close()
-		os.Remove(f.Name())
-		return err
+	w := bufio.NewWriterSize(f, 1<<20)
+	enc := jsontext.NewEncoder(w)
+	err = json.MarshalEncode(enc, record{UpdatedAt: updatedAt})
+	for k := 0; err == nil && k < len(recs); k++ {
+		err = json.MarshalEncode(enc, recs[k])
 	}
-	if err := f.Close(); err != nil {
+	if err == nil {
+		err = w.Flush()
+	}
+	if err == nil {
+		err = f.Close()
+	} else {
+		f.Close()
+	}
+	if err != nil {
 		os.Remove(f.Name())
 		return err
 	}
 	return os.Rename(f.Name(), indexFile)
-}
-
-func (i *Index) Recover() error {
-	fmt.Fprint(os.Stderr, "Verifying index... (may take a while)")
-
-	var recovered int
-	var bar *progress
-	err := filepath.WalkDir(dst, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			return nil
-		}
-		if !d.IsDir() {
-			return nil
-		}
-		if d.Name()[0] == '@' {
-			return filepath.SkipDir
-		}
-		if !strings.ContainsRune(d.Name(), '@') {
-			return nil
-		}
-
-		rel, err := filepath.Rel(dst, path)
-		if err != nil {
-			return nil
-		}
-		lastAt := strings.LastIndexByte(rel, '@')
-		escapedPath := rel[:lastAt]
-		version := rel[lastAt+1:]
-
-		modPath, err := module.UnescapePath(escapedPath)
-		if err != nil {
-			return filepath.SkipDir
-		}
-
-		if _, ok := i.OnDisk[modPath]; !ok {
-			i.OnDisk[modPath] = version
-			recovered++
-			if bar == nil {
-				fmt.Fprint(os.Stderr, "\n")
-				bar = newProgress("Recovering index...", 0)
-			}
-			bar.Increment()
-		}
-		return filepath.SkipDir
-	})
-	if err != nil {
-		return err
-	}
-	if recovered == 0 {
-		fmt.Fprint(os.Stderr, " ok\n")
-	} else {
-		bar.Finish()
-		log.Printf("recovered %d modules from disk", recovered)
-	}
-	return nil
 }
 
 func (i *Index) Close() error {
@@ -718,12 +785,12 @@ func (i *Index) Close() error {
 
 func (i *Index) next(ctx context.Context) (*Version, error) {
 	v := &Version{}
-	err := i.d.Decode(v)
+	err := json.UnmarshalDecode(i.d, v)
 	if err == io.EOF {
 		if err := i.nextPage(ctx); err != nil {
 			return nil, err
 		}
-		err = i.d.Decode(v)
+		err = json.UnmarshalDecode(i.d, v)
 	}
 	if err != nil {
 		return nil, err
@@ -747,7 +814,7 @@ func (i *Index) nextPage(ctx context.Context) error {
 		return fmt.Errorf("GET %q: %v", url, res.Status)
 	}
 	i.body = res.Body
-	i.d = json.NewDecoder(res.Body)
+	i.d = jsontext.NewDecoder(res.Body)
 	return nil
 }
 
