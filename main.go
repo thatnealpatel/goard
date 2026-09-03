@@ -49,7 +49,8 @@ var (
 
 	dst       string
 	tmp       string
-	indexFile string
+	indexFile string // feed cursor, a small JSON object
+	logFile   string // module entries, append-only JSON lines
 )
 
 func main() {
@@ -65,11 +66,14 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	dst = filepath.Join(home, ".gomodproxy")
-	tmp = filepath.Join(dst, "@TEMP")
-	indexFile = filepath.Join(dst, "@INDEX")
-	// Anything left in tmp is from an interrupted
-	// run and was never recorded in the index.
+	root := filepath.Join(home, ".goard")
+	dst = filepath.Join(root, "modules")
+	tmp = filepath.Join(root, "tmp")
+	indexFile = filepath.Join(root, "index.json")
+	logFile = filepath.Join(root, "fetch.jsonl")
+
+	// Anything left in tmp is from an interrupted run and was never recorded in
+	// the index.
 	if err := errors.Join(os.MkdirAll(dst, 0o755), os.RemoveAll(tmp), os.MkdirAll(tmp, 0o755)); err != nil {
 		log.Fatal(err)
 	}
@@ -83,7 +87,7 @@ func main() {
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
-	log.Println("using:", dst)
+	log.Println("using:", root)
 
 	// Fetch the index from disk, or create
 	// a new index from scratch.
@@ -124,11 +128,9 @@ func main() {
 	}
 
 	var (
-		wg       sync.WaitGroup
-		sem      = make(chan struct{}, 256)
-		lastSave atomic.Int64
+		wg  sync.WaitGroup
+		sem = make(chan struct{}, 256)
 	)
-	lastSave.Store(time.Now().UnixMilli())
 	for path, version := range incrementalUpdates {
 		if err := ctx.Err(); err != nil { // slower than select+case, but ok
 			bar.Finish()
@@ -379,9 +381,8 @@ func main() {
 				bar.Error(path, " ", version, " ", err)
 				return
 			}
-			// The index is canonical: a directory it does
-			// not know about is a leftover from an
-			// interrupted run, not a cached module.
+			// The index is canonical: a directory it does not know about is
+			// a leftover from an interrupted run, not a cached module.
 			if err := os.RemoveAll(filepath.Join(dst, modDir)); err != nil {
 				bar.Error(path, " ", version, " ", err)
 				return
@@ -393,14 +394,6 @@ func main() {
 			if err := index.Record(path, version, written); err != nil {
 				bar.Error(path, " ", version, " ", err)
 				return
-			}
-
-			if ts := lastSave.Load(); time.Since(time.UnixMilli(ts)) > 30*time.Second {
-				if lastSave.CompareAndSwap(ts, time.Now().UnixMilli()) {
-					if err := index.Save(); err != nil {
-						bar.Error("checkpoint: ", err)
-					}
-				}
 			}
 		})
 	}
@@ -524,33 +517,37 @@ func NewIndex(ctx context.Context) *Index {
 	var i Index
 
 	i.Mods = make(map[string]Entry)
-	f, err := os.Open(indexFile)
-	switch {
+
+	// The cursor is only advanced after the
+	// log holds everything the feed reported
+	// up to it, so a missing or stale cursor
+	// at worst replays feed entries, which
+	// is idempotent.
+	var m meta
+	switch b, err := os.ReadFile(indexFile); {
 	case errors.Is(err, os.ErrNotExist):
 		log.Println("building new INDEX (this may take a while)")
-
 	case err != nil:
-		log.Fatalf("cannot open %q: %v", indexFile, err)
-
+		log.Fatalf("cannot read %q: %v", indexFile, err)
 	default:
-		if err := i.load(f); err != nil {
+		if err := json.Unmarshal(b, &m, json.RejectUnknownMembers(true)); err != nil {
 			log.Fatalf("cannot decode %q: %v", indexFile, err)
 		}
-		f.Close()
-
-		// Backup the previous INDEX. Save replaces
-		// indexFile by rename, so a hard link keeps
-		// the old contents without copying them.
-		i.backupFile = indexFile + "." + strconv.Itoa(int(time.Now().UnixMilli()))
-		if err := os.Link(indexFile, i.backupFile); err != nil {
-			log.Fatalf("could not backup %s: %v", indexFile, err)
-		}
 	}
+
+	f, err := os.OpenFile(logFile, os.O_RDWR|os.O_APPEND|os.O_CREATE, 0o644)
+	if err != nil {
+		log.Fatalf("cannot open %q: %v", logFile, err)
+	}
+	if err := i.load(f); err != nil {
+		log.Fatalf("cannot replay %q: %v", logFile, err)
+	}
+	i.logF = f
 
 	// Set last such that duplicates since
 	// last pull may occur; however, we will
 	// not miss any new entries.
-	i.last = i.UpdatedAt
+	i.last = m.UpdatedAt
 	i.UpdatedAt = time.Now()
 
 	// Pre-seed [Index] with the next page to
@@ -582,12 +579,19 @@ type Entry struct {
 	Bytes    int64  `json:",omitzero"` // bytes written for OnDisk
 }
 
-// record is one line of the index file. The first line carries
-// UpdatedAt and no Path; every other line is an Entry keyed by Path.
+// record is one line of the log: an Entry
+// keyed by Path. A path may appear many
+// times; the last line wins on replay.
 type record struct {
-	Path      string    `json:",omitzero"`
-	UpdatedAt time.Time `json:",omitzero"`
+	Path string
 	Entry
+}
+
+// meta is the contents of indexFile: how
+// far into the feed the log is known to
+// be complete.
+type meta struct {
+	UpdatedAt time.Time
 }
 
 // Latest returns the version @latest
@@ -632,14 +636,17 @@ type Index struct {
 
 	UpdatedAt time.Time
 
-	pruned     atomic.Int64
-	backupFile string
-	last       time.Time
-	d          *jsontext.Decoder
-	body       io.ReadCloser
+	pruned atomic.Int64
+	last   time.Time
+	d      *jsontext.Decoder
+	body   io.ReadCloser
+
+	logF *os.File // fetch.jsonl, opened O_APPEND
+	err  error    // first append failure, reported by Close
 }
 
-// load reads an index written by Save.
+// load replays a log into the map, last
+// line per path winning.
 func (i *Index) load(r io.Reader) error {
 	dec := jsontext.NewDecoder(bufio.NewReaderSize(r, 1<<20))
 	for {
@@ -651,12 +658,22 @@ func (i *Index) load(r io.Reader) error {
 		if err != nil {
 			return err
 		}
-		if rec.Path == "" {
-			i.UpdatedAt = rec.UpdatedAt
-			continue
-		}
 		i.Mods[rec.Path] = rec.Entry
 	}
+}
+
+// append writes the current entry for
+// path to the log in one write call.
+// Callers hold mu.
+func (i *Index) append(path string) {
+	if i.err != nil {
+		return
+	}
+	b, err := json.Marshal(record{Path: path, Entry: i.Mods[path]})
+	if err == nil {
+		_, err = i.logF.Write(append(b, '\n'))
+	}
+	i.err = err
 }
 
 // Record marks version as extracted under dst with n bytes
@@ -678,7 +695,8 @@ func (i *Index) Record(path, version string, n int64) error {
 	}
 	e.OnDisk, e.Bytes = version, n
 	i.Mods[path] = e
-	return nil
+	i.append(path)
+	return i.err
 }
 
 // Reject marks version as evaluated and not
@@ -690,6 +708,7 @@ func (i *Index) Reject(path, version string) {
 	e := i.Mods[path]
 	e.Rejected = version
 	i.Mods[path] = e
+	i.append(path)
 }
 
 // Total returns the bytes written for every module on disk.
@@ -730,43 +749,71 @@ func (i *Index) Update(ctx context.Context) error {
 
 	bar.Finish()
 	log.Printf("index: %d new modules, %d new versions", newMod, changedMod)
-	return nil
+
+	// Feed results are not logged as they
+	// arrive, so make the log complete
+	// before advancing the cursor past them.
+	return i.checkpoint()
 }
 
-// Save atomically replaces the index file. The map is snapshotted
-// under the lock so workers are not stalled for the encode.
-func (i *Index) Save() error {
-	i.mu.Lock()
-	recs := make([]record, 0, len(i.Mods))
-	for path, e := range i.Mods {
-		recs = append(recs, record{Path: path, Entry: e})
+// checkpoint compacts the log to the
+// current map, then records the cursor.
+// In that order: a crash between the
+// two replays feed entries, which is
+// harmless, whereas the reverse would
+// skip them.
+func (i *Index) checkpoint() error {
+	if err := i.compact(); err != nil {
+		return err
 	}
-	updatedAt := i.UpdatedAt
-	i.mu.Unlock()
+	b, err := json.Marshal(meta{UpdatedAt: i.UpdatedAt})
+	if err != nil {
+		return err
+	}
+	p := filepath.Join(tmp, filepath.Base(indexFile))
+	if err := os.WriteFile(p, append(b, '\n'), 0o644); err != nil {
+		return err
+	}
+	return os.Rename(p, indexFile)
+}
 
-	f, err := os.CreateTemp(filepath.Dir(indexFile), "@INDEX.tmp.*")
+// compact rewrites the log as one line
+// per path and reopens it for appending.
+// Only called when no workers are
+// running.
+func (i *Index) compact() error {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	if i.err != nil {
+		return i.err
+	}
+	p := filepath.Join(tmp, filepath.Base(logFile))
+	f, err := os.Create(p)
 	if err != nil {
 		return err
 	}
-	w := bufio.NewWriterSize(f, 1<<20)
+	w := bufio.NewWriter(f)
 	enc := jsontext.NewEncoder(w)
-	err = json.MarshalEncode(enc, record{UpdatedAt: updatedAt})
-	for k := 0; err == nil && k < len(recs); k++ {
-		err = json.MarshalEncode(enc, recs[k])
+	for path, e := range i.Mods {
+		if err := json.MarshalEncode(enc, record{Path: path, Entry: e}); err != nil {
+			f.Close()
+			return err
+		}
 	}
-	if err == nil {
-		err = w.Flush()
-	}
-	if err == nil {
-		err = f.Close()
-	} else {
+	if err := w.Flush(); err != nil {
 		f.Close()
-	}
-	if err != nil {
-		os.Remove(f.Name())
 		return err
 	}
-	return os.Rename(f.Name(), indexFile)
+	if err := os.Rename(p, logFile); err != nil {
+		f.Close()
+		return err
+	}
+	// f is now logFile and positioned at its
+	// end, so it simply becomes the handle
+	// further appends go through.
+	i.logF.Close()
+	i.logF = f
+	return nil
 }
 
 func (i *Index) Close() error {
@@ -774,13 +821,9 @@ func (i *Index) Close() error {
 		i.body.Close()
 		i.body = nil
 	}
-	if err := i.Save(); err != nil {
-		return err
-	}
-	if i.backupFile != "" {
-		os.Remove(i.backupFile)
-	}
-	return nil
+	err := i.checkpoint()
+	i.logF.Close()
+	return err
 }
 
 func (i *Index) next(ctx context.Context) (*Version, error) {

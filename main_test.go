@@ -8,56 +8,111 @@ import (
 	"time"
 )
 
-func TestIndexSaveLoad(t *testing.T) {
-	indexFile = filepath.Join(t.TempDir(), "@INDEX")
-
-	want := &Index{
-		Mods: map[string]Entry{
-			"example.com/a": {Release: "v1.2.0", Prerelease: "v1.3.0-rc1", OnDisk: "v1.2.0", Bytes: 4096},
-			"example.com/b": {Pseudo: "v0.0.0-20250101000000-abcdefabcdef", Rejected: "v0.0.0-20250101000000-abcdefabcdef"},
-			"example.com/c": {},
-		},
-		UpdatedAt: time.Date(2026, 9, 3, 12, 0, 0, 0, time.UTC),
+// openIndex mirrors the file handling in
+// NewIndex without the feed.
+func openIndex(t *testing.T) *Index {
+	t.Helper()
+	i := &Index{Mods: make(map[string]Entry)}
+	f, err := os.OpenFile(logFile, os.O_RDWR|os.O_APPEND|os.O_CREATE, 0o644)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if err := want.Save(); err != nil {
+	if err := i.load(f); err != nil {
+		t.Fatal(err)
+	}
+	i.logF = f
+	return i
+}
+
+func TestIndexLogRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	indexFile = filepath.Join(dir, "index.json")
+	logFile = filepath.Join(dir, "fetch.jsonl")
+	dst = filepath.Join(dir, "modules")
+	tmp = filepath.Join(dir, "tmp")
+	if err := os.MkdirAll(tmp, 0o755); err != nil {
 		t.Fatal(err)
 	}
 
-	raw, err := os.ReadFile(indexFile)
+	// Run 1: entries arrive from the feed,
+	// then two are fetched, and one of those
+	// is later superseded.
+	i := openIndex(t)
+	i.UpdatedAt = time.Date(2026, 9, 3, 12, 0, 0, 0, time.UTC)
+	i.Mods["example.com/a"] = Entry{Release: "v1.2.0", Prerelease: "v1.3.0-rc1"}
+	i.Mods["example.com/b"] = Entry{Pseudo: "v0.0.0-20250101000000-abcdefabcdef"}
+	i.Mods["example.com/c"] = Entry{}
+	if err := i.checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+	if err := i.Record("example.com/a", "v1.2.0", 4096); err != nil {
+		t.Fatal(err)
+	}
+	i.Reject("example.com/b", "v0.0.0-20250101000000-abcdefabcdef")
+	if err := i.Record("example.com/a", "v1.2.1", 5000); err != nil {
+		t.Fatal(err)
+	}
+
+	// The log now has the compacted entries
+	// plus three appends, and a crash here
+	// must lose none of them.
+	raw, err := os.ReadFile(logFile)
 	if err != nil {
 		t.Fatal(err)
 	}
 	lines := strings.Split(strings.TrimSuffix(string(raw), "\n"), "\n")
-	if len(lines) != 1+len(want.Mods) {
-		t.Fatalf("got %d lines, want %d:\n%s", len(lines), 1+len(want.Mods), raw)
+	if len(lines) != 3+3 {
+		t.Fatalf("got %d log lines, want 6:\n%s", len(lines), raw)
 	}
-	if !strings.HasPrefix(lines[0], `{"UpdatedAt":`) || strings.Contains(lines[0], "Path") {
-		t.Errorf("bad header line: %s", lines[0])
+	for _, l := range lines {
+		if !strings.HasPrefix(l, `{"Path":"example.com/`) || strings.Contains(l, `""`) || strings.Contains(l, "UpdatedAt") {
+			t.Errorf("bad log line: %s", l)
+		}
 	}
-	for _, l := range lines[1:] {
-		if strings.Contains(l, "UpdatedAt") || strings.Contains(l, `""`) {
-			t.Errorf("entry line has header or empty fields: %s", l)
+	i.logF.Close()
+
+	// Run 2: replay without a clean Close.
+	j := openIndex(t)
+	want := map[string]Entry{
+		"example.com/a": {Release: "v1.2.0", Prerelease: "v1.3.0-rc1", OnDisk: "v1.2.1", Bytes: 5000},
+		"example.com/b": {Pseudo: "v0.0.0-20250101000000-abcdefabcdef", Rejected: "v0.0.0-20250101000000-abcdefabcdef"},
+		"example.com/c": {},
+	}
+	if len(j.Mods) != len(want) {
+		t.Fatalf("got %d entries, want %d", len(j.Mods), len(want))
+	}
+	for path, e := range want {
+		if j.Mods[path] != e {
+			t.Errorf("%s: got %+v, want %+v", path, j.Mods[path], e)
 		}
 	}
 
-	f, err := os.Open(indexFile)
+	// Cursor was written by checkpoint and is a single object.
+	raw, err = os.ReadFile(indexFile)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
-	got := &Index{Mods: make(map[string]Entry)}
-	if err := got.load(f); err != nil {
+	if string(raw) != `{"UpdatedAt":"2026-09-03T12:00:00Z"}`+"\n" {
+		t.Errorf("bad index.json: %s", raw)
+	}
+
+	// Close compacts: one line per path, same contents.
+	j.UpdatedAt = i.UpdatedAt
+	if err := j.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if !got.UpdatedAt.Equal(want.UpdatedAt) {
-		t.Errorf("UpdatedAt: got %v, want %v", got.UpdatedAt, want.UpdatedAt)
+	raw, err = os.ReadFile(logFile)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if len(got.Mods) != len(want.Mods) {
-		t.Fatalf("got %d entries, want %d", len(got.Mods), len(want.Mods))
+	if n := strings.Count(string(raw), "\n"); n != len(want) {
+		t.Errorf("after compact got %d lines, want %d:\n%s", n, len(want), raw)
 	}
-	for path, e := range want.Mods {
-		if got.Mods[path] != e {
-			t.Errorf("%s: got %+v, want %+v", path, got.Mods[path], e)
+	k := openIndex(t)
+	defer k.logF.Close()
+	for path, e := range want {
+		if k.Mods[path] != e {
+			t.Errorf("after compact %s: got %+v, want %+v", path, k.Mods[path], e)
 		}
 	}
 }
