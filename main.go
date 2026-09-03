@@ -2,6 +2,9 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+// Package main implements a program that pulls
+// an opinionated subset of modules from the Go
+// Module Mirror.
 package main
 
 import (
@@ -51,7 +54,6 @@ var (
 func main() {
 	var (
 		profile   = flag.Bool("pprof", false, "enable profiling endpoint.")
-		all       = flag.Bool("all", false, "include potential forks (mismatching and missing go.mod)")
 		verify    = flag.Bool("verify", false, "recover index from disk before updating")
 		indexOnly = flag.Bool("index", false, "update index only")
 	)
@@ -85,8 +87,8 @@ func main() {
 	defer cancel()
 	log.Println("using:", dst)
 
-	// Fetch the index from disk, or
-	// create a new index from scratch.
+	// Fetch the index from disk, or create
+	// a new index from scratch.
 	index := NewIndex(ctx)
 	defer func() {
 		if err := index.Close(); err != nil {
@@ -194,12 +196,14 @@ func main() {
 				invalidGoMod.Add(1)
 				return
 			case mod == nil || mod.Module == nil:
-				// Without this invariant, panic at runtime happens:
-				// e.g. github.com/Maka8ka/Faygo/client@v0.0.0-20220420085059-439b6b39f779
-				// e.g. github.com/maka8ka/faygo/client@v0.0.0-20220420085059-439b6b39f779
+				// Without this invariant, panic
+				// at runtime happens: e.g.
+				// github.com/Maka8ka/Faygo/client@v0.0.0-20220420085059-439b6b39f779
+				// e.g.
+				// github.com/maka8ka/faygo/client@v0.0.0-20220420085059-439b6b39f779
 				nilModOrModule.Add(1)
 				return
-			case mod.Module.Mod.Path != path && !*all:
+			case mod.Module.Mod.Path != path:
 				mismatchedGoMod.Add(1)
 				return
 			default:
@@ -218,25 +222,20 @@ func main() {
 			size := tail.size
 			tailBytes.Add(int64(len(tail.data)))
 
-			// Prefilter on the central directory: skip the full
-			// download unless the zip contains a go.mod (or, with
-			// -all, at least one .go file). Zips whose central
-			// directory does not fit in the tail are downloaded
+			// Prefilter on the central directory:
+			// skip the full download unless
+			// the zip contains a go.mod. Zips
+			// whose central directory does not
+			// fit in the tail are downloaded
 			// unconditionally and filtered below.
 			if !tail.whole {
-				switch hasGoMod, hasGo, modSize, ok := scanZipTail(tail); {
+				switch hasGoMod, ok := scanZipTail(tail); {
 				case !ok:
 					prefilterFallback.Add(1)
-				case hasGoMod || (*all && hasGo):
-				default:
+				case !hasGoMod:
 					prefilterSkipped.Add(1)
 					prefilterSaved.Add(size - int64(len(tail.data)))
-					if *all {
-						noGoCode.Add(1)
-						nonGoSize.Add(modSize)
-					} else {
-						noGoMod.Add(1)
-					}
+					noGoMod.Add(1)
 					return
 				}
 			}
@@ -253,9 +252,10 @@ func main() {
 				}
 			}
 
-			// Prevent an unlucky cluster of large modules
-			// from potentially causing an OOM while not
-			// slowing down the common path.
+			// Prevent an unlucky cluster of large
+			// modules from potentially causing
+			// an OOM while not slowing down the
+			// common path.
 			var (
 				z          *zip.Reader
 				zipCleanup = func() {}
@@ -331,13 +331,8 @@ func main() {
 				nonGoSize.Add(modSize)
 			}
 
-			if !hasGoMod && !*all {
+			if !hasGoMod {
 				noGoMod.Add(1)
-				return
-			}
-			if !hasGoMod && !hasGoFiles {
-				// -all: mirror the prefilter rule for zips that
-				// bypassed it (whole-tail or fallback download).
 				return
 			}
 
@@ -430,10 +425,8 @@ func main() {
 	fmt.Fprintf(os.Stderr, "Nil:                  % 9d\n", nilModOrModule.Load())
 	fmt.Fprintf(os.Stderr, "Unknown:              % 9d\n", unknown.Load())
 	fmt.Fprintf(os.Stderr, "Invalid go.mod:       % 9d\n", invalidGoMod.Load())
-	if !*all {
-		fmt.Fprintf(os.Stderr, "Mismatching go.mod:   % 9d\n", mismatchedGoMod.Load())
-		fmt.Fprintf(os.Stderr, "No go.mod file:       % 9d\n", noGoMod.Load())
-	}
+	fmt.Fprintf(os.Stderr, "Mismatching go.mod:   % 9d\n", mismatchedGoMod.Load())
+	fmt.Fprintf(os.Stderr, "No go.mod file:       % 9d\n", noGoMod.Load())
 	nonGoGiB := float64(nonGoSize.Load()) / float64(1<<30)
 	fmt.Fprintf(os.Stderr, "No .go files:         % 9d (%.1f GiB)\n", noGoCode.Load(), nonGoGiB)
 	savedGiB := float64(prefilterSaved.Load()) / float64(1<<30)
@@ -467,9 +460,9 @@ var (
 	goFiles         atomic.Int64
 	nonGoSize       atomic.Uint64
 
-	// Since goBytes and goFiles count
-	// all the extensions in ignoreFile
-	// it's not a true representation.
+	// Since goBytes and goFiles count all
+	// the extensions in ignoreFile it's not
+	// a true representation.
 	onlyGoSrcFiles     atomic.Int64
 	onlyGoSrcFilesSize atomic.Uint64
 
@@ -816,10 +809,13 @@ func fetchMod(ctx context.Context, path, version string) ([]byte, error) {
 	return io.ReadAll(res.Body)
 }
 
-// tailFetchSize is how much of the end of a zip is fetched with a
-// Range request. It must comfortably exceed the 64 KiB maximum EOCD
-// comment so archive/zip can always locate the directory, and covers
-// the full central directory for all but many-thousand-file modules.
+// tailFetchSize is how much of the end of
+// a zip is fetched with a Range request.
+// It must comfortably exceed the 64 KiB
+// maximum EOCD comment so archive/zip can
+// always locate the directory, and covers
+// the full central directory for all but
+// many-thousand-file modules.
 const tailFetchSize = 256 << 10
 
 type zipTail struct {
@@ -829,9 +825,9 @@ type zipTail struct {
 	whole bool   // data is the complete zip
 }
 
-// fetchZipTail requests the last tailFetchSize bytes of the zip. For
-// zips no larger than that the response is the entire zip; otherwise
-// the tail contains the central directory for prefiltering.
+// fetchZipTail requests the last tailFetchSize bytes of the zip. For zips no
+// larger than that the response is the entire zip; otherwise the tail contains
+// the central directory for prefiltering.
 func fetchZipTail(ctx context.Context, path, version string) (*zipTail, error) {
 	url, err := proxyURL(path, version, ".zip")
 	if err != nil {
@@ -873,8 +869,8 @@ func fetchZipTail(ctx context.Context, path, version string) (*zipTail, error) {
 			}
 			return &zipTail{data: data, size: int64(len(data)), url: res.Request.URL.String(), whole: true}, nil
 		}
-		// Too large (or unknown size) to buffer: hand back only the
-		// metadata and let the caller refetch to a file.
+		// Too large (or unknown size) to buffer: hand back only the metadata and let
+		// the caller refetch to a file.
 		return &zipTail{size: res.ContentLength, url: res.Request.URL.String()}, nil
 
 	default:
@@ -882,9 +878,12 @@ func fetchZipTail(ctx context.Context, path, version string) (*zipTail, error) {
 	}
 }
 
-// tailReaderAt exposes the tail of a zip as a ReaderAt over the full
-// file, erroring on reads before the tail so archive/zip fails cleanly
-// when the central directory is not fully contained in it.
+// tailReaderAt exposes the tail of a
+// zip as a ReaderAt over the full file,
+// erroring on reads before the tail
+// so archive/zip fails cleanly when
+// the central directory is not fully
+// contained in it.
 type tailReaderAt struct {
 	data []byte
 	off  int64 // offset of data[0] within the full file
@@ -905,27 +904,25 @@ func (r *tailReaderAt) ReadAt(p []byte, off int64) (int, error) {
 	return n, nil
 }
 
-// scanZipTail reads the central directory out of a partial zip. ok is
-// false when the directory is not fully contained in the tail (or the
-// tail is absent), in which case the zip must be downloaded to decide.
-func scanZipTail(t *zipTail) (hasGoMod, hasGo bool, modSize uint64, ok bool) {
+// scanZipTail reads the central directory out of
+// a partial zip. ok is false when the directory
+// is not fully contained in the tail (or the
+// tail is absent), in which case the zip must be
+// downloaded to decide.
+func scanZipTail(t *zipTail) (hasGoMod, ok bool) {
 	if t.data == nil {
-		return false, false, 0, false
+		return false, false
 	}
 	z, err := zip.NewReader(&tailReaderAt{data: t.data, off: t.size - int64(len(t.data))}, t.size)
 	if err != nil {
-		return false, false, 0, false
+		return false, false
 	}
 	for _, f := range z.File {
-		modSize += f.UncompressedSize64
-		if strings.HasSuffix(f.Name, ".go") {
-			hasGo = true
-		}
 		if strings.HasSuffix(f.Name, "/go.mod") {
-			hasGoMod = true
+			return true, true
 		}
 	}
-	return hasGoMod, hasGo, modSize, true
+	return false, true
 }
 
 func fetchZipToFile(ctx context.Context, path, version string) (*os.File, error) {
@@ -977,8 +974,9 @@ func fetchZip(ctx context.Context, path, version string) ([]byte, error) {
 	if res.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("GET %q: %v", url, res.Status)
 	}
-	// I experimented with using Range requests to back the zip
-	// ReaderAt, but it was extremely slow.
+	// I experimented with using Range
+	// requests to back the zip ReaderAt,
+	// but it was extremely slow.
 	return io.ReadAll(res.Body)
 }
 
