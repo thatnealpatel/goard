@@ -126,10 +126,9 @@ func main() {
 	}
 
 	var (
-		wg          sync.WaitGroup
-		upstreamSem = make(chan struct{}, 256)
-		gcpSem      = make(chan struct{}, 2048)
-		lastSave    atomic.Int64
+		wg       sync.WaitGroup
+		sem      = make(chan struct{}, 256)
+		lastSave atomic.Int64
 	)
 	lastSave.Store(time.Now().UnixMilli())
 	for path, version := range incrementalUpdates {
@@ -139,10 +138,9 @@ func main() {
 			break
 		}
 
-		upstreamSem <- struct{}{}
+		sem <- struct{}{}
 		wg.Go(func() {
-			releaseOnce := &sync.Once{}
-			defer releaseOnce.Do(func() { <-upstreamSem })
+			defer func() { <-sem }()
 			defer bar.Increment()
 
 			if strings.Contains(path, "/vendor/") ||
@@ -240,16 +238,8 @@ func main() {
 				}
 			}
 
-			// Swap the sem based on the data source.
-			if strings.HasPrefix(tail.url, "https://storage.googleapis.com/") {
-				if size > 0 {
-					gcsBytes.Add(size)
-				}
-				if !tail.whole {
-					releaseOnce.Do(func() { <-upstreamSem })
-					gcpSem <- struct{}{}
-					defer func() { <-gcpSem }()
-				}
+			if size > 0 && strings.HasPrefix(tail.url, "https://storage.googleapis.com/") {
+				gcsBytes.Add(size)
 			}
 
 			// Prevent an unlucky cluster of large
