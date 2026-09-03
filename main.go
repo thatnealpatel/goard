@@ -49,9 +49,27 @@ var (
 
 	dst       string
 	tmp       string
-	indexFile string // feed cursor, a small JSON object
-	logFile   string // module entries, append-only JSON lines
+	indexFile string   // feed cursor, a small JSON object
+	logFile   string   // module entries, append-only JSON lines
+	largeLog  *os.File // large.jsonl: kept modules over largeThreshold
 )
+
+// largeThreshold is the uncompressed
+// size of a module's zip above which it
+// is noted in large.jsonl for review.
+const largeThreshold = 128 << 20
+
+// inMemoryZipMax is the largest zip
+// buffered in memory rather than streamed
+// to a temp file. With 256 workers it
+// bounds download buffers at 4 GiB.
+const inMemoryZipMax = 16 << 20
+
+type largeRecord struct {
+	Path, Version string
+	Size          uint64 // uncompressed bytes of every file in the zip
+	Written       int64  // bytes extracted
+}
 
 func main() {
 	var (
@@ -77,6 +95,11 @@ func main() {
 	if err := errors.Join(os.MkdirAll(dst, 0o755), os.RemoveAll(tmp), os.MkdirAll(tmp, 0o755)); err != nil {
 		log.Fatal(err)
 	}
+	largeLog, err = os.OpenFile(filepath.Join(root, "large.jsonl"), os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o644)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer largeLog.Close()
 
 	if *profile {
 		go func() {
@@ -215,19 +238,24 @@ func main() {
 			tailBytes.Add(int64(len(tail.data)))
 
 			// Prefilter on the central directory:
-			// skip the full download unless
-			// the zip contains a go.mod. Zips
-			// whose central directory does not
-			// fit in the tail are downloaded
+			// skip the full download unless the
+			// zip contains a go.mod and at least
+			// one .go file that would be kept.
+			// Zips whose central directory does
+			// not fit in the tail are downloaded
 			// unconditionally and filtered below.
 			if !tail.whole {
-				switch hasGoMod, ok := scanZipTail(tail); {
+				switch hasGoMod, hasGoSrc, ok := scanZipTail(tail); {
 				case !ok:
 					prefilterFallback.Add(1)
-				case !hasGoMod:
+				case !hasGoMod, !hasGoSrc:
 					prefilterSkipped.Add(1)
 					prefilterSaved.Add(size - int64(len(tail.data)))
-					noGoMod.Add(1)
+					if !hasGoMod {
+						noGoMod.Add(1)
+					} else {
+						noGoCode.Add(1)
+					}
 					index.Reject(path, version)
 					return
 				}
@@ -254,7 +282,7 @@ func main() {
 					bar.Error(path, " ", version, " ", err)
 					return
 				}
-			case size > 100<<20 || size < 0:
+			case size > inMemoryZipMax || size < 0:
 				f, err := fetchZipToFile(ctx, path, version)
 				switch err {
 				case nil:
@@ -298,26 +326,27 @@ func main() {
 				allBytes.Add(size)
 			}
 
-			var hasGoMod, hasGoFiles bool
+			var hasGoMod, hasGoSrc bool
 			var modSize uint64
 
 			for _, f := range z.File {
 				modSize += f.UncompressedSize64
-				if strings.HasSuffix(f.Name, ".go") {
-					hasGoFiles = true
+				if isGoSrc(f.Name) {
+					hasGoSrc = true
 				}
 				if strings.HasSuffix(f.Name, "/go.mod") {
 					hasGoMod = true
 				}
 			}
 
-			if !hasGoFiles {
+			switch {
+			case !hasGoMod:
+				noGoMod.Add(1)
+				index.Reject(path, version)
+				return
+			case !hasGoSrc:
 				noGoCode.Add(1)
 				nonGoSize.Add(modSize)
-			}
-
-			if !hasGoMod {
-				noGoMod.Add(1)
 				index.Reject(path, version)
 				return
 			}
@@ -395,6 +424,13 @@ func main() {
 				bar.Error(path, " ", version, " ", err)
 				return
 			}
+			if modSize > largeThreshold {
+				large.Add(1)
+				b, _ := json.Marshal(largeRecord{Path: path, Version: version, Size: modSize, Written: written})
+				if _, err := largeLog.Write(append(b, '\n')); err != nil {
+					bar.Error(path, " ", version, " ", err)
+				}
+			}
 		})
 	}
 
@@ -415,7 +451,8 @@ func main() {
 	fmt.Fprintf(os.Stderr, "Mismatching go.mod:   % 9d\n", mismatchedGoMod.Load())
 	fmt.Fprintf(os.Stderr, "No go.mod file:       % 9d\n", noGoMod.Load())
 	nonGoGiB := float64(nonGoSize.Load()) / float64(1<<30)
-	fmt.Fprintf(os.Stderr, "No .go files:         % 9d (%.1f GiB)\n", noGoCode.Load(), nonGoGiB)
+	fmt.Fprintf(os.Stderr, "No .go files:         % 9d (%.1f GiB downloaded)\n", noGoCode.Load(), nonGoGiB)
+	fmt.Fprintf(os.Stderr, "Large (>%dM):         % 9d\n", largeThreshold>>20, large.Load())
 	savedGiB := float64(prefilterSaved.Load()) / float64(1<<30)
 	fmt.Fprintf(os.Stderr, "Prefiltered:          % 9d (%.1f GiB not downloaded)\n", prefilterSkipped.Load(), savedGiB)
 	fmt.Fprintf(os.Stderr, "                      ---------\n")
@@ -441,6 +478,7 @@ var (
 	invalidGoMod    atomic.Int64
 	noGoCode        atomic.Int64
 	noGoMod         atomic.Int64
+	large           atomic.Int64
 	gcsBytes        atomic.Int64
 	good            atomic.Int64
 	goBytes         atomic.Int64
@@ -962,7 +1000,7 @@ func fetchZipTail(ctx context.Context, path, version string) (*zipTail, error) {
 
 	case http.StatusOK:
 		// The server ignored the Range; the body is the whole zip.
-		if res.ContentLength >= 0 && res.ContentLength <= 100<<20 {
+		if res.ContentLength >= 0 && res.ContentLength <= inMemoryZipMax {
 			data, err := io.ReadAll(res.Body)
 			if err != nil {
 				return nil, err
@@ -1004,25 +1042,33 @@ func (r *tailReaderAt) ReadAt(p []byte, off int64) (int, error) {
 	return n, nil
 }
 
-// scanZipTail reads the central directory out of
-// a partial zip. ok is false when the directory
-// is not fully contained in the tail (or the
-// tail is absent), in which case the zip must be
-// downloaded to decide.
-func scanZipTail(t *zipTail) (hasGoMod, ok bool) {
+// scanZipTail reads the central directory out of a partial
+// zip. ok is false when the directory is not fully contained
+// in the tail (or the tail is absent), in which case the zip
+// must be downloaded to decide.
+func scanZipTail(t *zipTail) (hasGoMod, hasGoSrc, ok bool) {
 	if t.data == nil {
-		return false, false
+		return false, false, false
 	}
 	z, err := zip.NewReader(&tailReaderAt{data: t.data, off: t.size - int64(len(t.data))}, t.size)
 	if err != nil {
-		return false, false
+		return false, false, false
 	}
 	for _, f := range z.File {
 		if strings.HasSuffix(f.Name, "/go.mod") {
-			return true, true
+			hasGoMod = true
+		}
+		if isGoSrc(f.Name) {
+			hasGoSrc = true
 		}
 	}
-	return false, true
+	return hasGoMod, hasGoSrc, true
+}
+
+// isGoSrc reports whether name is a .go
+// file that extraction would keep.
+func isGoSrc(name string) bool {
+	return strings.HasSuffix(name, ".go") && !ignoreFile(name)
 }
 
 func fetchZipToFile(ctx context.Context, path, version string) (*os.File, error) {
