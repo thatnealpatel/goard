@@ -117,6 +117,89 @@ func TestIndexLogRoundTrip(t *testing.T) {
 	}
 }
 
+func TestFeedRanges(t *testing.T) {
+	until := time.Date(2026, 9, 4, 14, 0, 0, 0, time.UTC)
+
+	// A zero cursor covers the whole history
+	// in contiguous, non-overlapping pieces.
+	rs := feedRanges(time.Time{}, until)
+	if rs[0][0] != feedStart {
+		t.Errorf("first range starts at %v, want %v", rs[0][0], feedStart)
+	}
+	if last := rs[len(rs)-1][1]; last != until {
+		t.Errorf("last range ends at %v, want %v", last, until)
+	}
+	for k := 1; k < len(rs); k++ {
+		if rs[k][0] != rs[k-1][1] {
+			t.Errorf("gap between %v and %v", rs[k-1][1], rs[k][0])
+		}
+	}
+	if len(rs) < 80 {
+		t.Errorf("got %d ranges for 7 years, want at least 80", len(rs))
+	}
+
+	// A recent cursor is a single range.
+	since := until.Add(-3 * 24 * time.Hour)
+	if rs := feedRanges(since, until); len(rs) != 1 || rs[0] != [2]time.Time{since, until} {
+		t.Errorf("recent cursor: got %v", rs)
+	}
+
+	// Nothing to do yields nothing.
+	if rs := feedRanges(until, until); len(rs) != 0 {
+		t.Errorf("empty span: got %v", rs)
+	}
+}
+
+// TestWalkFeedLive checks the sharded
+// walk against a single cursor over a
+// span crossing a month boundary. It
+// needs the network.
+func TestWalkFeedLive(t *testing.T) {
+	if testing.Short() {
+		t.Skip("network")
+	}
+	ctx := t.Context()
+	since := time.Date(2019, 4, 20, 0, 0, 0, 0, time.UTC)
+	until := time.Date(2019, 6, 5, 0, 0, 0, 0, time.UTC)
+	if n := len(feedRanges(since, until)); n != 2 {
+		t.Fatalf("span should split into 2 ranges, got %d", n)
+	}
+
+	collect := func(walk func(chan<- *Version) error) map[string]bool {
+		out := make(chan *Version, 1024)
+		errc := make(chan error, 1)
+		go func() { errc <- walk(out); close(out) }()
+		seen := make(map[string]bool)
+		for v := range out {
+			seen[v.Path+"@"+v.Version] = true
+		}
+		if err := <-errc; err != nil {
+			t.Fatal(err)
+		}
+		return seen
+	}
+	single := collect(func(out chan<- *Version) error { return walkRange(ctx, since, until, out) })
+	sharded := collect(func(out chan<- *Version) error { return walkFeed(ctx, since, until, out) })
+
+	if len(single) == 0 || len(sharded) == 0 {
+		t.Fatalf("empty: single %d, sharded %d", len(single), len(sharded))
+	}
+	if len(single) != len(sharded) {
+		t.Errorf("single %d entries, sharded %d", len(single), len(sharded))
+	}
+	for k := range single {
+		if !sharded[k] {
+			t.Errorf("sharded missing %s", k)
+		}
+	}
+	for k := range sharded {
+		if !single[k] {
+			t.Errorf("single missing %s", k)
+		}
+	}
+	t.Logf("%d entries over %d ranges", len(single), len(feedRanges(since, until)))
+}
+
 func TestIndexLoadRejectsUnknownFields(t *testing.T) {
 	i := &Index{Mods: make(map[string]Entry)}
 	err := i.load(strings.NewReader(`{"Path":"example.com/a","Latest":"v1.0.0"}` + "\n"))

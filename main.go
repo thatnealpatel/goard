@@ -114,7 +114,7 @@ func main() {
 
 	// Fetch the index from disk, or create
 	// a new index from scratch.
-	index := NewIndex(ctx)
+	index := NewIndex()
 	defer func() {
 		if err := index.Close(); err != nil {
 			log.Println("failed to save index:", err)
@@ -551,7 +551,7 @@ func (p *progress) Finish() {
 	fmt.Fprint(os.Stderr, "\n")
 }
 
-func NewIndex(ctx context.Context) *Index {
+func NewIndex() *Index {
 	var i Index
 
 	i.Mods = make(map[string]Entry)
@@ -582,17 +582,11 @@ func NewIndex(ctx context.Context) *Index {
 	}
 	i.logF = f
 
-	// Set last such that duplicates since
-	// last pull may occur; however, we will
-	// not miss any new entries.
-	i.last = m.UpdatedAt
+	// Update walks the feed over [since,
+	// UpdatedAt). Entries at or after
+	// UpdatedAt belong to the next run.
+	i.since = m.UpdatedAt
 	i.UpdatedAt = time.Now()
-
-	// Pre-seed [Index] with the next page to
-	// incrementally update the cache.
-	if err := i.nextPage(ctx); err != nil {
-		log.Fatalf("cannot get first page: %v", err)
-	}
 
 	return &i
 }
@@ -675,9 +669,7 @@ type Index struct {
 	UpdatedAt time.Time
 
 	pruned atomic.Int64
-	last   time.Time
-	d      *jsontext.Decoder
-	body   io.ReadCloser
+	since  time.Time // cursor from the previous run
 
 	logF *os.File // fetch.jsonl, opened O_APPEND
 	err  error    // first append failure, reported by Close
@@ -762,15 +754,19 @@ func (i *Index) Total() (n int64) {
 func (i *Index) Update(ctx context.Context) error {
 	bar := newProgress("Updating index...", 0)
 
+	// Walkers decode pages in parallel; the
+	// map is only touched here, in order of
+	// arrival. observe is a max so arrival
+	// order does not matter.
+	feed := make(chan *Version, 4096)
+	walkErr := make(chan error, 1)
+	go func() {
+		walkErr <- walkFeed(ctx, i.since, i.UpdatedAt, feed)
+		close(feed)
+	}()
+
 	var newMod, changedMod int
-	for {
-		v, err := i.next(ctx)
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return err
-		}
+	for v := range feed {
 		bar.Increment()
 
 		e, ok := i.Mods[v.Path]
@@ -783,6 +779,10 @@ func (i *Index) Update(ctx context.Context) error {
 		} else {
 			newMod++
 		}
+	}
+	if err := <-walkErr; err != nil {
+		bar.Finish()
+		return err
 	}
 
 	bar.Finish()
@@ -855,48 +855,148 @@ func (i *Index) compact() error {
 }
 
 func (i *Index) Close() error {
-	if i.body != nil {
-		i.body.Close()
-		i.body = nil
-	}
 	err := i.checkpoint()
 	i.logF.Close()
 	return err
 }
 
-func (i *Index) next(ctx context.Context) (*Version, error) {
-	v := &Version{}
-	err := json.UnmarshalDecode(i.d, v)
-	if err == io.EOF {
-		if err := i.nextPage(ctx); err != nil {
-			return nil, err
-		}
-		err = json.UnmarshalDecode(i.d, v)
+// feedStart predates the first entry in index.golang.org,
+// so a zero cursor walks the whole history.
+var feedStart = time.Date(2019, 4, 1, 0, 0, 0, 0, time.UTC)
+
+const feedWorkers = 16
+
+// feedRanges splits [since, until) into month-sized
+// pieces. The feed is paged by timestamp only, so
+// parallelism comes from walking disjoint time ranges.
+func feedRanges(since, until time.Time) [][2]time.Time {
+	if since.IsZero() || since.Before(feedStart) {
+		since = feedStart
 	}
+	var rs [][2]time.Time
+	for start := since; start.Before(until); {
+		end := start.AddDate(0, 1, 0)
+		if end.After(until) {
+			end = until
+		}
+		rs = append(rs, [2]time.Time{start, end})
+		start = end
+	}
+	return rs
+}
+
+// walkFeed sends every feed entry with a timestamp in [since, until) to out, in
+// no particular order across ranges.
+func walkFeed(ctx context.Context, since, until time.Time, out chan<- *Version) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	work := make(chan [2]time.Time)
+	errc := make(chan error, feedWorkers)
+	for range feedWorkers {
+		go func() {
+			for r := range work {
+				if err := walkRange(ctx, r[0], r[1], out); err != nil {
+					errc <- err
+					return
+				}
+			}
+			errc <- nil
+		}()
+	}
+
+	rs := feedRanges(since, until)
+	var err error
+	for k := 0; k < len(rs) && err == nil; k++ {
+		select {
+		case work <- rs[k]:
+		case err = <-errc:
+			cancel()
+		}
+	}
+	close(work)
+	for range feedWorkers {
+		if e := <-errc; err == nil && e != nil {
+			err = e
+		}
+	}
+	return err
+}
+
+// walkRange pages through [start, end).
+func walkRange(ctx context.Context, start, end time.Time, out chan<- *Version) error {
+	for cursor := start; ; {
+		vs, err := fetchFeedPage(ctx, cursor)
+		if err != nil {
+			return err
+		}
+		if len(vs) == 0 {
+			return nil
+		}
+		for _, v := range vs {
+			if !v.Timestamp.Before(end) {
+				return nil
+			}
+			select {
+			case out <- v:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		// Set cursor such that duplicates may
+		// occur; however, we will not miss any
+		// new entries.
+		cursor = vs[len(vs)-1].Timestamp.Add(1)
+	}
+}
+
+// fetchFeedPage returns one page of the feed at or after since, retrying
+// transient failures with backoff.
+func fetchFeedPage(ctx context.Context, since time.Time) ([]*Version, error) {
+	url := "https://index.golang.org/index?since=" + since.Format(time.RFC3339Nano)
+	var lastErr error
+	for attempt := range 5 {
+		if attempt > 0 {
+			select {
+			case <-time.After(time.Duration(1<<attempt) * time.Second):
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		vs, err := fetchFeedPageOnce(ctx, url)
+		if err == nil {
+			return vs, nil
+		}
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		lastErr = err
+	}
+	return nil, lastErr
+}
+
+func fetchFeedPageOnce(ctx context.Context, url string) ([]*Version, error) {
+	res, err := httpClient.Do(newRequestWithContext(ctx, "GET", url))
 	if err != nil {
 		return nil, err
 	}
-	i.last = v.Timestamp
-	return v, nil
-}
-
-func (i *Index) nextPage(ctx context.Context) error {
-	if i.body != nil {
-		i.body.Close()
-		i.body = nil
-	}
-	url := "https://index.golang.org/index?since=" + i.last.Add(1).Format(time.RFC3339Nano)
-	res, err := httpClient.Do(newRequestWithContext(ctx, "GET", url))
-	if err != nil {
-		return err
-	}
+	defer res.Body.Close()
 	if res.StatusCode != http.StatusOK {
-		res.Body.Close()
-		return fmt.Errorf("GET %q: %v", url, res.Status)
+		return nil, fmt.Errorf("GET %q: %v", url, res.Status)
 	}
-	i.body = res.Body
-	i.d = jsontext.NewDecoder(res.Body)
-	return nil
+	var vs []*Version
+	dec := jsontext.NewDecoder(res.Body)
+	for {
+		v := &Version{}
+		err := json.UnmarshalDecode(dec, v)
+		if err == io.EOF {
+			return vs, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		vs = append(vs, v)
+	}
 }
 
 func newRequestWithContext(ctx context.Context, method, url string) *http.Request {
