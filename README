@@ -1,15 +1,36 @@
-Run:
-  [GOGC=off GOMEMLIMIT=<80% of RAM>] go run . -all
+patel.codes/goard is an opinionated, modern
+CLI for managing a local go module cache.
 
-This repository was originally a set of patches on a fork of 
-https://github.com/FiloSottile/mostly-harmless/tree/main/allcode.
+i recommend `GOMEMLIMIT=<0.75 * main memory>`
+when running this program.
 
-All previous patches and the original code have been preserved
-in this repository's history. Since this repository has diverged
-in functionality and the previous upstream contains more than
-just this particular module, it is forked here under a new name.
+flags:
+  -index   update the index only, no downloads
 
----
+layout (~/.goard):
+  index.json   feed cursor
+  fetch.jsonl  append-only module path log; compacts on exit
+  large.jsonl  debug only (>128 MiB decompressed modules)
+  modules/     GOMODCACHE layout
+  tmp/         staging, wiped at startup
 
-There is no promise anything in here will be maintained, will
-keep compiling, or ever compiled.
+using brtfs on a remote machine,
+
+```
+sudo truncate -s 700G /corpus.img
+DEV=$(sudo losetup --find --show --direct-io=on /corpus.img)
+sudo mkfs.btrfs -q "$DEV"
+mkdir -p ~/.goard
+sudo mount -o noatime,compress=zstd:3 "$DEV" ~/.goard
+sudo chown "$USER" ~/.goard
+```
+
+then, build the index:
+  ./goard -index 2>&1 | tee index.log
+
+and, download the modules:
+  GOMEMLIMIT=<lim> nohup ./goard > pull.log 2>&1 &
+
+this repository was original a set of patches
+over https://github.com/FiloSottile/mostly-harmless/tree/main/allcode
+but diverged and became its own program here.
